@@ -1,0 +1,234 @@
+name: Dependency Autopilot (reusable)
+
+# Centralized self-healing dependency loop, called by a thin stub in each repo.
+#
+#   Dependabot opens a PR  ->  the repo's CI runs  ->  this workflow (via the
+#   stub's `workflow_run` trigger) either:
+#     * CI green -> auto-merges, IF it's a genuine same-repo Dependabot PR AND
+#       the ENTIRE check rollup is green AND the bump is safe (grouped
+#       minor/patch, or a single non-major).
+#     * CI red   -> Codex reads the failed logs and pushes the minimal code fix,
+#       which re-triggers CI. (Needs CODEX_AUTH + a push token; skips cleanly
+#       where those aren't available, e.g. public repos until the GitHub App.)
+#
+# SECURITY (this is callable from PUBLIC repos, so the guards are load-bearing):
+#   * Auto-merge requires author == dependabot[bot] AND isCrossRepository == false.
+#     A spoofed `dependabot/*` fork branch is rejected on both counts.
+#   * Auto-fix re-validates the same, checks out with persist-credentials:false,
+#     runs Codex network-sandboxed, and refuses to commit lockfile/manifest/
+#     workflow edits.
+#   * No long-lived secret is needed for the merge path (default GITHUB_TOKEN).
+
+on:
+  workflow_call:
+    inputs:
+      ci_conclusion:
+        description: "Conclusion of the triggering CI run (success|failure|...)"
+        required: true
+        type: string
+      pr_branch:
+        description: "head_branch from the workflow_run event"
+        required: true
+        type: string
+      ci_run_id:
+        description: "Triggering CI run id (to read failed logs on the fix path)"
+        required: true
+        type: string
+      ecosystem:
+        description: "pnpm | npm | pip — selects the auto-fix toolchain"
+        required: false
+        default: "pnpm"
+        type: string
+    secrets:
+      CI_BOT_PAT:
+        required: false
+      CODEX_AUTH:
+        required: false
+
+jobs:
+  # ---------------- AUTO-MERGE (CI green) — no custom secret ----------------
+  automerge:
+    if: ${{ inputs.ci_conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Merge if a genuine, fully-green, safe Dependabot PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ inputs.pr_branch }}
+        run: |
+          set -euo pipefail
+          gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open \
+            --json number,author,isCrossRepository,title > /tmp/prs.json
+          num=$(jq -r '.[0].number // empty' /tmp/prs.json)
+          [ -n "$num" ] || { echo "No open PR for $BRANCH"; exit 0; }
+          author=$(jq -r '.[0].author.login' /tmp/prs.json)
+          xrepo=$(jq -r '.[0].isCrossRepository' /tmp/prs.json)
+          title=$(jq -r '.[0].title' /tmp/prs.json)
+          echo "PR #$num by '$author' (cross-repo=$xrepo): $title"
+
+          # --- HARD GUARDS (critical on public repos) ---
+          [ "$author" = "dependabot[bot]" ] || { echo "::notice::author not dependabot — skip"; exit 0; }
+          [ "$xrepo" = "false" ] || { echo "::notice::cross-repository PR — refuse to merge"; exit 0; }
+
+          # --- require the WHOLE check rollup to be green (robust for multi-gate repos) ---
+          checks=$(gh pr view "$num" --repo "$GITHUB_REPOSITORY" --json statusCheckRollup -q '.statusCheckRollup | length')
+          green=$(gh pr view "$num" --repo "$GITHUB_REPOSITORY" --json statusCheckRollup -q '
+            [ .statusCheckRollup[]?
+              | (if .__typename=="CheckRun"
+                   then (.status=="COMPLETED" and ((.conclusion // "") | test("SUCCESS|SKIPPED|NEUTRAL")))
+                   else ((.state // "") == "SUCCESS") end) ] | all')
+          echo "check rollup: count=$checks all_green=$green"
+          { [ "${checks:-0}" -gt 0 ] && [ "$green" = "true" ]; } || { echo "::notice::not all checks green yet — skip (will re-fire when the rest finish)"; exit 0; }
+
+          # --- classify the bump ---
+          if [[ "$BRANCH" == *"minor-and-patch"* || "$BRANCH" == *"github-actions"* ]]; then
+            echo "Grouped minor/patch — auto-merging."
+            gh pr merge "$num" --repo "$GITHUB_REPOSITORY" --squash
+            exit 0
+          fi
+          if [[ "$title" =~ from\ ([0-9]+)\.[0-9]+\.[0-9]+.*to\ ([0-9]+)\.[0-9]+\.[0-9]+ ]]; then
+            if [ "${BASH_REMATCH[1]}" = "${BASH_REMATCH[2]}" ]; then
+              echo "Single non-major — auto-merging."
+              gh pr merge "$num" --repo "$GITHUB_REPOSITORY" --squash
+            else
+              echo "::notice::Major bump — leaving #$num for manual review."
+            fi
+          else
+            echo "::notice::Unclassifiable bump — leaving #$num for manual review."
+          fi
+
+  # ---------------- AUTO-FIX (CI red) — needs Codex creds + push token ----------------
+  autofix:
+    if: ${{ inputs.ci_conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    steps:
+      - name: Preconditions (skip cleanly if creds not inherited)
+        id: pre
+        env:
+          CODEX_AUTH: ${{ secrets.CODEX_AUTH }}
+          CI_BOT_PAT: ${{ secrets.CI_BOT_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CODEX_AUTH:-}" ] || [ -z "${CI_BOT_PAT:-}" ]; then
+            echo "::notice::Auto-fix needs CODEX_AUTH + a push token, not available here (public repo / secrets not inherited). Auto-merge stays active. Add the GitHub App to enable auto-fix on this repo."
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate target PR (dependabot, same-repo, base=main)
+        if: steps.pre.outputs.ok == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ inputs.pr_branch }}
+        run: |
+          set -euo pipefail
+          gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open \
+            --json number,author,baseRefName,isCrossRepository > /tmp/pr.json
+          node <<'NODE'
+          const fs=require('fs');
+          const pr=(JSON.parse(fs.readFileSync('/tmp/pr.json','utf8')))[0];
+          if(!pr){ console.log('no open PR'); process.exit(1); }
+          const author=pr.author&&pr.author.login;
+          if(author!=='dependabot[bot]') throw new Error('author not dependabot: '+author);
+          if(pr.isCrossRepository) throw new Error('cross-repository PR not allowed');
+          if(pr.baseRefName!=='main') throw new Error('base must be main, got '+pr.baseRefName);
+          console.log('validated dependency PR #'+pr.number);
+          NODE
+
+      - name: Checkout PR branch (no persisted creds)
+        if: steps.pre.outputs.ok == '1'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup pnpm
+        if: ${{ steps.pre.outputs.ok == '1' && inputs.ecosystem == 'pnpm' }}
+        uses: pnpm/action-setup@v4
+      - name: Setup Node
+        if: ${{ steps.pre.outputs.ok == '1' && (inputs.ecosystem == 'pnpm' || inputs.ecosystem == 'npm') }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Setup uv (Python)
+        if: ${{ steps.pre.outputs.ok == '1' && inputs.ecosystem == 'pip' }}
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install Codex CLI (pinned)
+        if: steps.pre.outputs.ok == '1'
+        run: |
+          npm install -g @openai/codex@0.142.4
+          codex --version
+
+      - name: Restore Codex subscription auth
+        if: steps.pre.outputs.ok == '1'
+        env:
+          CODEX_AUTH: ${{ secrets.CODEX_AUTH }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.codex"
+          printf '%s' "$CODEX_AUTH" > "$HOME/.codex/auth.json"
+          chmod 600 "$HOME/.codex/auth.json"
+
+      - name: Codex — fix from the failed CI logs
+        if: steps.pre.outputs.ok == '1'
+        id: codex
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.ci_run_id }}
+        run: |
+          set +e
+          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --log-failed > /tmp/fail.log 2>/dev/null
+          if [ ! -s /tmp/fail.log ]; then echo "::error::no failed logs for run $RUN_ID"; exit 1; fi
+          echo "Fetched $(wc -l < /tmp/fail.log) lines of failed CI logs."
+          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --log-failed \
+            | codex exec \
+                --sandbox workspace-write \
+                --skip-git-repo-check \
+                -c model_provider=openai \
+                -o /tmp/codex-last.txt \
+                "The failed CI logs for this dependency-update PR are on stdin. Make the MINIMAL application-code changes needed for compatibility with the new dependency versions so the build and tests pass. Do NOT change dependency versions, lockfiles, package.json/pyproject.toml, or workflow files. Do NOT refactor unrelated code. Prefer editing source over running installs. If you cannot fix it, stop and explain why."
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+          echo "----- codex final message -----"
+          cat /tmp/codex-last.txt 2>/dev/null || true
+          exit 0
+
+      - name: Guard changed files
+        if: steps.pre.outputs.ok == '1'
+        id: guard
+        run: |
+          set -euo pipefail
+          git diff --name-only > /tmp/changed.txt
+          echo "Changed files:"; cat /tmp/changed.txt
+          if [ ! -s /tmp/changed.txt ]; then
+            echo "::notice::Codex produced no changes (nothing to fix, or it declined)."
+            echo "changed=0" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if grep -E '(^|/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock|bun\.lock|package\.json|pyproject\.toml|uv\.lock|poetry\.lock)$|^\.github/workflows/' /tmp/changed.txt; then
+            echo "::error::Codex touched dependency/lockfile/workflow files — refusing to auto-commit."
+            exit 1
+          fi
+          echo "changed=1" >> "$GITHUB_OUTPUT"
+
+      - name: Commit + push the fix (re-triggers CI)
+        if: ${{ steps.pre.outputs.ok == '1' && steps.guard.outputs.changed == '1' }}
+        env:
+          PUSH_TOKEN: ${{ secrets.CI_BOT_PAT }}
+        run: |
+          set -euo pipefail
+          git config user.name "codex-autofix"
+          git config user.email "codex-autofix@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(deps): Codex auto-fix for dependency breakage"
+          git push "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${{ inputs.pr_branch }}"
+          echo "::notice::Pushed via CI_BOT_PAT — CI will re-run to validate the fix."
