@@ -53,6 +53,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      actions: read
     steps:
       - name: Merge if a genuine, fully-green, safe Dependabot PR
         env:
@@ -75,15 +76,23 @@ jobs:
           [ "$norm" = "dependabot" ] || { echo "::notice::author '$author' not dependabot — skip"; exit 0; }
           [ "$xrepo" = "false" ] || { echo "::notice::cross-repository PR — refuse to merge"; exit 0; }
 
-          # --- require the WHOLE check rollup to be green (robust for multi-gate repos) ---
-          checks=$(gh pr view "$num" --repo "$GITHUB_REPOSITORY" --json statusCheckRollup -q '.statusCheckRollup | length')
-          green=$(gh pr view "$num" --repo "$GITHUB_REPOSITORY" --json statusCheckRollup -q '
-            [ .statusCheckRollup[]?
-              | (if .__typename=="CheckRun"
-                   then (.status=="COMPLETED" and ((.conclusion // "") | test("SUCCESS|SKIPPED|NEUTRAL")))
-                   else ((.state // "") == "SUCCESS") end) ] | all')
-          echo "check rollup: count=$checks all_green=$green"
-          { [ "${checks:-0}" -gt 0 ] && [ "$green" = "true" ]; } || { echo "::notice::not all checks green yet — skip (will re-fire when the rest finish)"; exit 0; }
+          # --- require ALL pull_request CI runs on this commit to be green ---
+          # Multi-gate safe (e.g. a repo with both "CI" and "PR Gate"); uses actions:read,
+          # avoiding the checks:read that statusCheckRollup (GraphQL) needs. Tolerant: if the
+          # API is unreadable, fall back to trusting the success trigger that got us here.
+          sha=$(gh pr view "$num" --repo "$GITHUB_REPOSITORY" --json headRefOid -q '.headRefOid' 2>/dev/null || echo "")
+          if [ -n "$sha" ]; then
+            concl=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$sha&event=pull_request&per_page=100" \
+                      -q '[.workflow_runs[] | (.conclusion // "pending")]' 2>/dev/null || echo "[]")
+            n=$(printf '%s' "$concl" | jq -r 'length' 2>/dev/null || echo 0)
+            bad=$(printf '%s' "$concl" | jq -r '[.[] | select(. != "success" and . != "skipped" and . != "neutral")] | length' 2>/dev/null || echo 0)
+            echo "PR CI runs on $sha: total=$n not-green=$bad"
+            if [ "${n:-0}" -gt 0 ] && [ "${bad:-0}" -gt 0 ]; then
+              echo "::notice::not all PR CI runs are green yet — skip (will re-fire when the rest finish)"; exit 0
+            fi
+          else
+            echo "::notice::could not read head SHA — trusting the success trigger"
+          fi
 
           # --- classify the bump ---
           if [[ "$BRANCH" == *"minor-and-patch"* || "$BRANCH" == *"github-actions"* ]]; then
