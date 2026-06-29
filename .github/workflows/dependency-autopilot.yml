@@ -70,7 +70,9 @@ jobs:
           echo "PR #$num by '$author' (cross-repo=$xrepo): $title"
 
           # --- HARD GUARDS (critical on public repos) ---
-          [ "$author" = "dependabot[bot]" ] || { echo "::notice::author not dependabot — skip"; exit 0; }
+          # gh returns the bot login as 'app/dependabot' on runners (not 'dependabot[bot]') — normalize both.
+          norm="${author#app/}"; norm="${norm%\[bot\]}"
+          [ "$norm" = "dependabot" ] || { echo "::notice::author '$author' not dependabot — skip"; exit 0; }
           [ "$xrepo" = "false" ] || { echo "::notice::cross-repository PR — refuse to merge"; exit 0; }
 
           # --- require the WHOLE check rollup to be green (robust for multi-gate repos) ---
@@ -138,7 +140,9 @@ jobs:
           const pr=(JSON.parse(fs.readFileSync('/tmp/pr.json','utf8')))[0];
           if(!pr){ console.log('no open PR'); process.exit(1); }
           const author=pr.author&&pr.author.login;
-          if(author!=='dependabot[bot]') throw new Error('author not dependabot: '+author);
+          // gh returns the bot login as 'app/dependabot' on runners — normalize 'app/' prefix + '[bot]' suffix.
+          const norm=(author||'').replace(/^app\//,'').replace(/\[bot\]$/,'').toLowerCase();
+          if(norm!=='dependabot') throw new Error('author not dependabot: '+author);
           if(pr.isCrossRepository) throw new Error('cross-repository PR not allowed');
           if(pr.baseRefName!=='main') throw new Error('base must be main, got '+pr.baseRefName);
           console.log('validated dependency PR #'+pr.number);
