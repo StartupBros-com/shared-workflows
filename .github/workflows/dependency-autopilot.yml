@@ -1,23 +1,26 @@
 name: Dependency Autopilot (reusable)
 
-# Centralized self-healing dependency loop, called by a thin stub in each repo.
+# Centralized dependency loop, called by a thin stub in each repo.
 #
-#   Dependabot opens a PR  ->  the repo's CI runs  ->  this workflow (via the
-#   stub's `workflow_run` trigger) either:
-#     * CI green -> auto-merges, IF it's a genuine same-repo Dependabot PR AND
-#       the ENTIRE check rollup is green AND the bump is safe (grouped
-#       minor/patch, or a single non-major).
+#   Dependabot opens a PR  ->  repo CI runs  ->  this workflow (via the stub's
+#   `workflow_run` trigger):
+#     * CI green -> TRIAGE: classify risk + label. In `mode: queue` (default) it
+#       labels `autopilot:ready` (safe, you click merge) or `autopilot:review`
+#       (needs a human). In `mode: automerge` it merges the safe ones.
 #     * CI red   -> Codex reads the failed logs and pushes the minimal code fix,
 #       which re-triggers CI. (Needs CODEX_AUTH + a push token; skips cleanly
 #       where those aren't available, e.g. public repos until the GitHub App.)
 #
-# SECURITY (this is callable from PUBLIC repos, so the guards are load-bearing):
-#   * Auto-merge requires author == dependabot[bot] AND isCrossRepository == false.
-#     A spoofed `dependabot/*` fork branch is rejected on both counts.
-#   * Auto-fix re-validates the same, checks out with persist-credentials:false,
-#     runs Codex network-sandboxed, and refuses to commit lockfile/manifest/
-#     workflow edits.
-#   * No long-lived secret is needed for the merge path (default GITHUB_TOKEN).
+# WHY queue is the default: auto-merge is only as safe as the CI behind it. Until
+# a repo's CI is a *required* gate with real tests, we prepare + label instead of
+# merging. Flip a repo to `mode: automerge` once its CI is trustworthy.
+#
+# SECURITY (callable from PUBLIC repos, so the guards are load-bearing):
+#   * Acts only on author == dependabot[bot] (gh: 'app/dependabot') AND
+#     isCrossRepository == false. A spoofed `dependabot/*` fork branch is rejected.
+#   * Auto-fix checks out with persist-credentials:false, runs Codex network-
+#     sandboxed, and refuses to commit lockfile/manifest/workflow edits.
+#   * No long-lived secret is needed for triage/merge (default GITHUB_TOKEN).
 
 on:
   workflow_call:
@@ -39,6 +42,11 @@ on:
         required: false
         default: "pnpm"
         type: string
+      mode:
+        description: "queue (label only, default) | automerge (merge safe bumps)"
+        required: false
+        default: "queue"
+        type: string
     secrets:
       CI_BOT_PAT:
         required: false
@@ -46,19 +54,20 @@ on:
         required: false
 
 jobs:
-  # ---------------- AUTO-MERGE (CI green) — no custom secret ----------------
-  automerge:
+  # ---------------- TRIAGE (CI green): classify risk, label, optionally merge ----------------
+  triage:
     if: ${{ inputs.ci_conclusion == 'success' }}
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
-      actions: read
+      contents: write          # merge (automerge mode only)
+      pull-requests: write      # labels
+      actions: read             # read sibling CI runs
     steps:
-      - name: Merge if a genuine, fully-green, safe Dependabot PR
+      - name: Classify a genuine Dependabot PR and label (merge only in automerge mode)
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ inputs.pr_branch }}
+          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open \
@@ -71,44 +80,53 @@ jobs:
           echo "PR #$num by '$author' (cross-repo=$xrepo): $title"
 
           # --- HARD GUARDS (critical on public repos) ---
-          # gh returns the bot login as 'app/dependabot' on runners (not 'dependabot[bot]') — normalize both.
+          # gh returns the bot login as 'app/dependabot' on runners — normalize both forms.
           norm="${author#app/}"; norm="${norm%\[bot\]}"
           [ "$norm" = "dependabot" ] || { echo "::notice::author '$author' not dependabot — skip"; exit 0; }
-          [ "$xrepo" = "false" ] || { echo "::notice::cross-repository PR — refuse to merge"; exit 0; }
+          [ "$xrepo" = "false" ] || { echo "::notice::cross-repository PR — skip"; exit 0; }
 
-          # --- require ALL pull_request CI runs on this commit to be green ---
-          # Multi-gate safe (e.g. a repo with both "CI" and "PR Gate"); uses actions:read,
-          # avoiding the checks:read that statusCheckRollup (GraphQL) needs. Tolerant: if the
-          # API is unreadable, fall back to trusting the success trigger that got us here.
+          # --- are ALL pull_request CI runs on this commit green? (actions:read) ---
+          allgreen=1
           sha=$(gh pr view "$num" --repo "$GITHUB_REPOSITORY" --json headRefOid -q '.headRefOid' 2>/dev/null || echo "")
           if [ -n "$sha" ]; then
             concl=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$sha&event=pull_request&per_page=100" \
                       -q '[.workflow_runs[] | (.conclusion // "pending")]' 2>/dev/null || echo "[]")
-            n=$(printf '%s' "$concl" | jq -r 'length' 2>/dev/null || echo 0)
             bad=$(printf '%s' "$concl" | jq -r '[.[] | select(. != "success" and . != "skipped" and . != "neutral")] | length' 2>/dev/null || echo 0)
-            echo "PR CI runs on $sha: total=$n not-green=$bad"
-            if [ "${n:-0}" -gt 0 ] && [ "${bad:-0}" -gt 0 ]; then
-              echo "::notice::not all PR CI runs are green yet — skip (will re-fire when the rest finish)"; exit 0
-            fi
-          else
-            echo "::notice::could not read head SHA — trusting the success trigger"
+            [ "${bad:-0}" -gt 0 ] && allgreen=0
           fi
 
-          # --- classify the bump ---
+          # --- classify risk tier ---
+          tier="review"; reason="unclassified"
           if [[ "$BRANCH" == *"minor-and-patch"* || "$BRANCH" == *"github-actions"* ]]; then
-            echo "Grouped minor/patch — auto-merging."
-            gh pr merge "$num" --repo "$GITHUB_REPOSITORY" --squash
-            exit 0
+            tier="safe"; reason="grouped minor/patch"
+          elif [[ "$title" =~ from\ ([0-9]+)\.([0-9]+)\.[0-9]+.*to\ ([0-9]+)\.([0-9]+)\.[0-9]+ ]]; then
+            fM="${BASH_REMATCH[1]}"; fm="${BASH_REMATCH[2]}"; tM="${BASH_REMATCH[3]}"; tm="${BASH_REMATCH[4]}"
+            if [ "$fM" != "$tM" ]; then
+              tier="review"; reason="major bump ${fM}.x -> ${tM}.x"
+            elif [ "$fM" = "0" ] && [ "$fm" != "$tm" ]; then
+              tier="review"; reason="0.x minor (${fM}.${fm} -> ${tM}.${tm}) — semver allows breaking"
+            else
+              tier="safe"; reason="single non-major bump"
+            fi
           fi
-          if [[ "$title" =~ from\ ([0-9]+)\.[0-9]+\.[0-9]+.*to\ ([0-9]+)\.[0-9]+\.[0-9]+ ]]; then
-            if [ "${BASH_REMATCH[1]}" = "${BASH_REMATCH[2]}" ]; then
-              echo "Single non-major — auto-merging."
+          if [ "$allgreen" != "1" ]; then tier="review"; reason="${reason}; not all CI green"; fi
+          echo "tier=$tier reason=$reason allgreen=$allgreen mode=$MODE"
+
+          # --- ensure labels exist (idempotent) ---
+          gh label create "autopilot:ready"  --repo "$GITHUB_REPOSITORY" --color 0e8a16 --description "Autopilot: CI green + low risk — safe to merge" 2>/dev/null || true
+          gh label create "autopilot:review" --repo "$GITHUB_REPOSITORY" --color fbca04 --description "Autopilot: needs a human look before merge" 2>/dev/null || true
+
+          if [ "$tier" = "safe" ]; then
+            gh pr edit "$num" --repo "$GITHUB_REPOSITORY" --add-label "autopilot:ready" --remove-label "autopilot:review" 2>/dev/null || true
+            if [ "$MODE" = "automerge" ]; then
+              echo "mode=automerge + safe -> merging."
               gh pr merge "$num" --repo "$GITHUB_REPOSITORY" --squash
             else
-              echo "::notice::Major bump — leaving #$num for manual review."
+              echo "::notice::queue mode — #$num is READY ($reason). Labeled autopilot:ready; merge when you're comfortable."
             fi
           else
-            echo "::notice::Unclassifiable bump — leaving #$num for manual review."
+            gh pr edit "$num" --repo "$GITHUB_REPOSITORY" --add-label "autopilot:review" --remove-label "autopilot:ready" 2>/dev/null || true
+            echo "::notice::#$num needs review ($reason). Labeled autopilot:review."
           fi
 
   # ---------------- AUTO-FIX (CI red) — needs Codex creds + push token ----------------
@@ -129,7 +147,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${CODEX_AUTH:-}" ] || [ -z "${CI_BOT_PAT:-}" ]; then
-            echo "::notice::Auto-fix needs CODEX_AUTH + a push token, not available here (public repo / secrets not inherited). Auto-merge stays active. Add the GitHub App to enable auto-fix on this repo."
+            echo "::notice::Auto-fix needs CODEX_AUTH + a push token, not available here (public repo / secrets not inherited). Add the GitHub App to enable auto-fix on this repo."
             echo "ok=0" >> "$GITHUB_OUTPUT"
           else
             echo "ok=1" >> "$GITHUB_OUTPUT"
@@ -149,7 +167,6 @@ jobs:
           const pr=(JSON.parse(fs.readFileSync('/tmp/pr.json','utf8')))[0];
           if(!pr){ console.log('no open PR'); process.exit(1); }
           const author=pr.author&&pr.author.login;
-          // gh returns the bot login as 'app/dependabot' on runners — normalize 'app/' prefix + '[bot]' suffix.
           const norm=(author||'').replace(/^app\//,'').replace(/\[bot\]$/,'').toLowerCase();
           if(norm!=='dependabot') throw new Error('author not dependabot: '+author);
           if(pr.isCrossRepository) throw new Error('cross-repository PR not allowed');
@@ -210,7 +227,7 @@ jobs:
                 --skip-git-repo-check \
                 -c model_provider=openai \
                 -o /tmp/codex-last.txt \
-                "The failed CI logs for this dependency-update PR are on stdin. Make the MINIMAL application-code changes needed for compatibility with the new dependency versions so the build and tests pass. Do NOT change dependency versions, lockfiles, package.json/pyproject.toml, or workflow files. Do NOT refactor unrelated code. Prefer editing source over running installs. If you cannot fix it, stop and explain why."
+                "The failed CI logs for this dependency-update PR are on stdin. You ARE in the checked-out repo working tree — read and edit the source files directly. Make the MINIMAL application-code changes needed for compatibility with the new dependency versions so the build and tests pass. Do NOT change dependency versions, lockfiles, package.json/pyproject.toml, or workflow files. Do NOT refactor unrelated code. Prefer editing source over running installs. If you genuinely cannot fix it, stop and explain why."
           echo "rc=$?" >> "$GITHUB_OUTPUT"
           echo "----- codex final message -----"
           cat /tmp/codex-last.txt 2>/dev/null || true
