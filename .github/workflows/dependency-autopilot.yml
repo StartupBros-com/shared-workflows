@@ -48,7 +48,9 @@ on:
         default: "queue"
         type: string
     secrets:
-      CI_BOT_PAT:
+      APP_ID:
+        required: false
+      APP_PRIVATE_KEY:
         required: false
       CODEX_AUTH:
         required: false
@@ -143,11 +145,12 @@ jobs:
         id: pre
         env:
           CODEX_AUTH: ${{ secrets.CODEX_AUTH }}
-          CI_BOT_PAT: ${{ secrets.CI_BOT_PAT }}
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          if [ -z "${CODEX_AUTH:-}" ] || [ -z "${CI_BOT_PAT:-}" ]; then
-            echo "::notice::Auto-fix needs CODEX_AUTH + a push token, not available here (public repo / secrets not inherited). Add the GitHub App to enable auto-fix on this repo."
+          if [ -z "${CODEX_AUTH:-}" ] || [ -z "${APP_ID:-}" ] || [ -z "${APP_PRIVATE_KEY:-}" ]; then
+            echo "::notice::Auto-fix needs CODEX_AUTH + the GitHub App creds (APP_ID/APP_PRIVATE_KEY), not available here (e.g. public repo / secrets not inherited)."
             echo "ok=0" >> "$GITHUB_OUTPUT"
           else
             echo "ok=1" >> "$GITHUB_OUTPUT"
@@ -250,10 +253,18 @@ jobs:
           fi
           echo "changed=1" >> "$GITHUB_OUTPUT"
 
+      - name: Mint a short-lived GitHub App token (scoped to this repo)
+        if: ${{ steps.pre.outputs.ok == '1' && steps.guard.outputs.changed == '1' }}
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - name: Commit + push the fix (re-triggers CI)
         if: ${{ steps.pre.outputs.ok == '1' && steps.guard.outputs.changed == '1' }}
         env:
-          PUSH_TOKEN: ${{ secrets.CI_BOT_PAT }}
+          PUSH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           set -euo pipefail
           git config user.name "codex-autofix"
@@ -261,4 +272,4 @@ jobs:
           git add -A
           git commit -m "fix(deps): Codex auto-fix for dependency breakage"
           git push "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${{ inputs.pr_branch }}"
-          echo "::notice::Pushed via CI_BOT_PAT — CI will re-run to validate the fix."
+          echo "::notice::Pushed via short-lived GitHub App token — CI will re-run to validate the fix."
