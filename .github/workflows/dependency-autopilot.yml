@@ -285,13 +285,15 @@ jobs:
           PUSH_TOKEN: ${{ steps.app.outputs.token }}
           BRANCH: ${{ inputs.pr_branch }}
           BASE_SHA: ${{ steps.pre.outputs.base_sha }}
+          NUM: ${{ steps.pre.outputs.number }}
         run: |
           set -euo pipefail
           # Pre-push freshness: if the remote branch advanced since we checked out
           # (a concurrent fix already landed, or a rebase), don't push a fix built on
           # stale code — skip cleanly rather than force a non-fast-forward.
-          git fetch -q origin "$BRANCH"
-          remote_sha=$(git rev-parse "origin/$BRANCH")
+          # Use ls-remote with the app token because persist-credentials:false leaves
+          # origin without credentials, which breaks git fetch on private repos.
+          remote_sha=$(git ls-remote "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/heads/$BRANCH" | awk '{print $1}')
           if [ "$remote_sha" != "$BASE_SHA" ]; then
             echo "::notice::branch advanced ($BASE_SHA -> $remote_sha) since checkout — another fix already landed; skipping push."
             exit 0
@@ -300,6 +302,15 @@ jobs:
           git config user.email "codex-autofix@users.noreply.github.com"
           git add -A
           git commit -m "fix(deps): Codex auto-fix for dependency breakage"
+          # Apply merge-blocking labels BEFORE pushing so the gate is active the
+          # instant CI sees the new commit. Abort here if labeling fails so AI code
+          # is never pushed without the review gate in place.
+          [ -n "$NUM" ] || { echo "::error::no PR number — cannot apply review gate labels; refusing to push AI fix unflagged"; exit 1; }
+          GH_TOKEN="$PUSH_TOKEN" gh label create "autopilot:autofixed" --repo "$GITHUB_REPOSITORY" \
+            --color d93f0b --description "Autopilot: contains AI-authored fix code — review before merge" 2>/dev/null || true
+          GH_TOKEN="$PUSH_TOKEN" gh label create "pro-review" --repo "$GITHUB_REPOSITORY" \
+            --color 5319e7 --description "GPT-5.5 Pro Extended final gate (pro-review-daemon)" 2>/dev/null || true
+          GH_TOKEN="$PUSH_TOKEN" gh pr edit "$NUM" --repo "$GITHUB_REPOSITORY" --add-label "autopilot:autofixed" --add-label "pro-review"
           # BRANCH via env (never interpolate event data into the shell).
           git push "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:$BRANCH"
           echo "pushed=1" >> "$GITHUB_OUTPUT"
