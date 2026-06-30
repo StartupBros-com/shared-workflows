@@ -318,5 +318,9 @@ jobs:
           # unflagged). Only the "label already exists" case is ignorable.
           gh label create "autopilot:autofixed" --repo "$GITHUB_REPOSITORY" \
             --color d93f0b --description "Autopilot: contains AI-authored fix code — review before merge" 2>/dev/null || true
+          # pro-review opts this PR into the GPT-5.5 Pro Extended gate (pro-review-daemon),
+          # so every AI-authored fix is deep-reviewed before a human merges it.
+          gh label create "pro-review" --repo "$GITHUB_REPOSITORY" \
+            --color 5319e7 --description "GPT-5.5 Pro Extended final gate (pro-review-daemon)" 2>/dev/null || true
           [ -n "$NUM" ] || { echo "::error::no PR number to flag — refusing to leave an AI fix unflagged"; exit 1; }
-          gh pr edit "$NUM" --repo "$GITHUB_REPOSITORY" --add-label "autopilot:autofixed"
+          gh pr edit "$NUM" --repo "$GITHUB_REPOSITORY" --add-label "autopilot:autofixed" --add-label "pro-review"
