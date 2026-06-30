@@ -136,6 +136,11 @@ jobs:
     if: ${{ inputs.ci_conclusion == 'failure' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # One fix attempt per PR branch at a time — a second CI failure won't race a
+    # fix already in flight (don't cancel: let the running fix finish + push).
+    concurrency:
+      group: autopilot-autofix-${{ github.repository }}-${{ inputs.pr_branch }}
+      cancel-in-progress: false
     permissions:
       contents: read
       pull-requests: read
@@ -179,7 +184,7 @@ jobs:
 
       - name: Checkout PR branch (no persisted creds)
         if: steps.pre.outputs.ok == '1'
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ inputs.pr_branch }}
           fetch-depth: 0
@@ -187,15 +192,15 @@ jobs:
 
       - name: Setup pnpm
         if: ${{ steps.pre.outputs.ok == '1' && inputs.ecosystem == 'pnpm' }}
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
       - name: Setup Node
         if: ${{ steps.pre.outputs.ok == '1' && (inputs.ecosystem == 'pnpm' || inputs.ecosystem == 'npm') }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: lts/*
       - name: Setup uv (Python)
         if: ${{ steps.pre.outputs.ok == '1' && inputs.ecosystem == 'pip' }}
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
 
       - name: Install Codex CLI (pinned)
         if: steps.pre.outputs.ok == '1'
@@ -256,7 +261,7 @@ jobs:
       - name: Mint a short-lived GitHub App token (scoped to this repo)
         if: ${{ steps.pre.outputs.ok == '1' && steps.guard.outputs.changed == '1' }}
         id: app
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -273,3 +278,17 @@ jobs:
           git commit -m "fix(deps): Codex auto-fix for dependency breakage"
           git push "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${{ inputs.pr_branch }}"
           echo "::notice::Pushed via short-lived GitHub App token — CI will re-run to validate the fix."
+
+      - name: Flag the PR as AI-authored (review before merge)
+        if: ${{ steps.pre.outputs.ok == '1' && steps.guard.outputs.changed == '1' }}
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BRANCH: ${{ inputs.pr_branch }}
+        run: |
+          set -euo pipefail
+          # This PR now contains AI-written fix code — flag it so a human runs the
+          # deep review gate (/ce-code-review, /pro-gate) before merging.
+          gh label create "autopilot:autofixed" --repo "$GITHUB_REPOSITORY" \
+            --color d93f0b --description "Autopilot: contains AI-authored fix code — review before merge" 2>/dev/null || true
+          num="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open --json number -q '.[0].number')"
+          [ -n "$num" ] && gh pr edit "$num" --repo "$GITHUB_REPOSITORY" --add-label "autopilot:autofixed" || true
