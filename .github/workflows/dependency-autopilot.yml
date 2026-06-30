@@ -140,6 +140,309 @@ jobs:
             echo "::notice::#$num needs review ($reason). Labeled autopilot:review."
           fi
 
+  # ---------------- CHANGELOG-RISK GATE (CI green): analyze release notes, score risk ----------------
+  changelog:
+    if: ${{ inputs.ci_conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write    # comment + label
+    steps:
+      - name: Fetch changelog, score risk, and comment on the PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ inputs.pr_branch }}
+          ECOSYSTEM: ${{ inputs.ecosystem }}
+        run: |
+          set -euo pipefail
+
+          # ── 1. Resolve + guard the PR ───────────────────────────────────────
+          gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open \
+            --json number,author,title > /tmp/cl-prs.json
+          num=$(jq -r '.[0].number // empty' /tmp/cl-prs.json)
+          [ -n "$num" ] || { echo "No open PR for $BRANCH"; exit 0; }
+          author=$(jq -r '.[0].author.login' /tmp/cl-prs.json)
+          title=$(jq  -r '.[0].title'        /tmp/cl-prs.json)
+          norm="${author#app/}"; norm="${norm%\[bot\]}"
+          [ "$norm" = "dependabot" ] || { echo "::notice::author '$author' not dependabot — skip"; exit 0; }
+          echo "Changelog gate: PR #$num '$title'"
+
+          # ── 2. Parse the bump from the PR title ─────────────────────────────
+          # Single-package: "... bump <pkg> from <old> to <new> ..."
+          pkg=""; old_ver=""; new_ver=""
+          if [[ "$title" =~ [Bb]ump[[:space:]]+([^[:space:]]+)[[:space:]]+from[[:space:]]+([^[:space:]]+)[[:space:]]+to[[:space:]]+([^[:space:]]+) ]]; then
+            pkg="${BASH_REMATCH[1]}"
+            old_ver="${BASH_REMATCH[2]}"
+            new_ver="${BASH_REMATCH[3]}"
+          fi
+
+          # Grouped update (no single from/to)
+          if [ -z "$pkg" ]; then
+            echo "Grouped update — posting informational comment."
+            # Build a best-effort compare link if repo is known
+            compare_hint="See each package's CHANGELOG or releases page for details."
+            gh label create "changelog:grouped" --repo "$GITHUB_REPOSITORY" \
+              --color ededed --description "Dependabot grouped update: review packages individually" 2>/dev/null || true
+            gh pr edit "$num" --repo "$GITHUB_REPOSITORY" --add-label "changelog:grouped" 2>/dev/null || true
+            cat > /tmp/cl-body.md <<'BODY_EOF'
+          ## 🔎 Changelog-risk review — grouped update
+
+          This is a grouped Dependabot update with multiple packages bumped at once.
+          Automated per-package changelog analysis is skipped in v1 for grouped updates.
+
+          **Action:** Review each bumped package individually via its linked compare URL
+          in the PR description, or inspect its releases page on GitHub/npm.
+
+          > _Changelog-risk gate v1 — grouped update pass-through._
+          BODY_EOF
+            gh pr comment "$num" --repo "$GITHUB_REPOSITORY" --body-file /tmp/cl-body.md 2>/dev/null || true
+            exit 0
+          fi
+
+          echo "pkg=$pkg  old=$old_ver  new=$new_ver"
+
+          # ── 3. Semver risk signal ────────────────────────────────────────────
+          semver_risk="LOW"
+          semver_reason="patch/minor bump"
+          # Strip leading 'v' from versions
+          ov="${old_ver#v}"; nv="${new_ver#v}"
+          old_major=$(echo "$ov" | cut -d. -f1)
+          old_minor=$(echo "$ov" | cut -d. -f2)
+          new_major=$(echo "$nv" | cut -d. -f1)
+          new_minor=$(echo "$nv" | cut -d. -f2)
+          if [ "$old_major" != "$new_major" ]; then
+            semver_risk="HIGH"; semver_reason="MAJOR version bump (${old_major}.x → ${new_major}.x)"
+          elif [ "$old_major" = "0" ] && [ "$old_minor" != "$new_minor" ]; then
+            semver_risk="HIGH"; semver_reason="0.x MINOR bump (${ov} → ${nv}) — semver allows breaking changes"
+          elif [ "$old_minor" != "$new_minor" ]; then
+            semver_risk="MEDIUM"; semver_reason="minor bump (${ov} → ${nv})"
+          fi
+
+          # ── 4. Fetch changelog/release notes ────────────────────────────────
+          gh_owner=""; gh_repo_name=""
+          npm_page="https://www.npmjs.com/package/${pkg}"
+          compare_url=""
+          release_notes=""
+
+          if [[ "$ECOSYSTEM" == "pnpm" || "$ECOSYSTEM" == "npm" ]]; then
+            # npm registry: resolve the GitHub repo from .repository.url
+            reg_url="https://registry.npmjs.org/${pkg}"
+            reg_json=$(curl -sf --max-time 10 "$reg_url" 2>/dev/null || echo "{}")
+            repo_url=$(echo "$reg_json" | jq -r '.repository.url // ""' 2>/dev/null || echo "")
+            # Normalize: git+https://github.com/owner/repo.git -> owner/repo
+            if [[ "$repo_url" =~ github\.com[:/]([^/]+)/([^/.]+)(\.git)?$ ]]; then
+              gh_owner="${BASH_REMATCH[1]}"
+              gh_repo_name="${BASH_REMATCH[2]}"
+            fi
+            if [ -n "$gh_owner" ] && [ -n "$gh_repo_name" ]; then
+              compare_url="https://github.com/${gh_owner}/${gh_repo_name}/compare/v${old_ver}...v${new_ver}"
+              # Fetch GitHub releases (up to 100, then filter for versions in range)
+              releases_json=$(gh api "repos/${gh_owner}/${gh_repo_name}/releases?per_page=100" 2>/dev/null || echo "[]")
+              # Collect body text from releases whose tag matches versions > old_ver and <= new_ver.
+              # We use Python for the semver filtering since bash arithmetic is fragile on semver.
+              release_notes=$(python3 - "$old_ver" "$new_ver" "$pkg" <<'PY_EOF' || echo ""
+          import sys, json, re
+
+          def parse_ver(v):
+              v = v.lstrip('v')
+              parts = re.split(r'[.\-]', v)
+              nums = []
+              for p in parts[:3]:
+                  try: nums.append(int(p))
+                  except: nums.append(0)
+              while len(nums) < 3: nums.append(0)
+              return tuple(nums)
+
+          old_v, new_v, pkg = sys.argv[1], sys.argv[2], sys.argv[3]
+          old_t, new_t = parse_ver(old_v), parse_ver(new_v)
+          pkg_short = pkg.split('/')[-1].lstrip('@')  # last segment of scoped pkg
+
+          try:
+              releases = json.load(sys.stdin)
+          except Exception:
+              releases = []
+
+          bodies = []
+          for rel in releases:
+              tag = rel.get('tag_name', '')
+              body = rel.get('body', '') or ''
+              # Match tag formats: v1.2.3, 1.2.3, pkg-name@1.2.3, pkg-name-v1.2.3
+              m = re.search(r'(?:^v?|@v?|[-_]v?)(\d+\.\d+[\.\d]*)(?:$|-|\.)', tag)
+              if not m: continue
+              try:
+                  tv = parse_ver(m.group(1))
+              except: continue
+              if old_t < tv <= new_t:
+                  header = f"### Release {tag}"
+                  bodies.append(header + "\n" + body[:2000])  # cap each release at 2k chars
+
+          print('\n\n'.join(bodies[:10]))  # cap at 10 releases
+          PY_EOF
+          )
+            fi
+            # Fallback compare URL if we couldn't get the GH repo
+            if [ -z "$compare_url" ]; then
+              compare_url="https://www.npmjs.com/package/${pkg}?activeTab=versions"
+            fi
+
+          elif [[ "$ECOSYSTEM" == "pip" ]]; then
+            # PyPI: lighter best-effort
+            pypi_json=$(curl -sf --max-time 10 "https://pypi.org/pypi/${pkg}/json" 2>/dev/null || echo "{}")
+            repo_url=$(echo "$pypi_json" | jq -r '
+              (.info.project_urls // {}) |
+              to_entries[] | select(.key | test("(?i)source|repository|code|github")) | .value
+              ' 2>/dev/null | head -1 || echo "")
+            if [[ "$repo_url" =~ github\.com[:/]([^/]+)/([^/.]+)(\.git)?$ ]]; then
+              gh_owner="${BASH_REMATCH[1]}"
+              gh_repo_name="${BASH_REMATCH[2]}"
+            fi
+            if [ -n "$gh_owner" ] && [ -n "$gh_repo_name" ]; then
+              compare_url="https://github.com/${gh_owner}/${gh_repo_name}/compare/v${old_ver}...v${new_ver}"
+              releases_json=$(gh api "repos/${gh_owner}/${gh_repo_name}/releases?per_page=100" 2>/dev/null || echo "[]")
+              release_notes=$(python3 - "$old_ver" "$new_ver" "$pkg" <<'PY_EOF' || echo ""
+          import sys, json, re
+
+          def parse_ver(v):
+              v = v.lstrip('v')
+              parts = re.split(r'[.\-]', v)
+              nums = []
+              for p in parts[:3]:
+                  try: nums.append(int(p))
+                  except: nums.append(0)
+              while len(nums) < 3: nums.append(0)
+              return tuple(nums)
+
+          old_v, new_v, pkg = sys.argv[1], sys.argv[2], sys.argv[3]
+          old_t, new_t = parse_ver(old_v), parse_ver(new_v)
+
+          try:
+              releases = json.load(sys.stdin)
+          except Exception:
+              releases = []
+
+          bodies = []
+          for rel in releases:
+              tag = rel.get('tag_name', '')
+              body = rel.get('body', '') or ''
+              m = re.search(r'(?:^v?|@v?|[-_]v?)(\d+\.\d+[\.\d]*)(?:$|-|\.)', tag)
+              if not m: continue
+              try:
+                  tv = parse_ver(m.group(1))
+              except: continue
+              if old_t < tv <= new_t:
+                  bodies.append(f"### Release {tag}\n" + body[:2000])
+
+          print('\n\n'.join(bodies[:10]))
+          PY_EOF
+          )
+            fi
+            if [ -z "$compare_url" ]; then
+              compare_url="https://pypi.org/project/${pkg}/#history"
+              npm_page="https://pypi.org/project/${pkg}/"
+            fi
+          fi
+
+          # ── 5. Risk keyword scan ─────────────────────────────────────────────
+          RISK_KEYWORDS="BREAKING|breaking change|deprecat|removed|security|CVE-|vulnerab|migration"
+          matched_lines=""
+          keyword_hit=0
+          if [ -n "$release_notes" ]; then
+            matched_lines=$(echo "$release_notes" | grep -iE "$RISK_KEYWORDS" | head -8 || true)
+            [ -n "$matched_lines" ] && keyword_hit=1
+          fi
+
+          # ── 6. Final verdict ─────────────────────────────────────────────────
+          verdict="$semver_risk"
+          verdict_reason="$semver_reason"
+          if [ "$keyword_hit" = "1" ] && [ "$verdict" != "HIGH" ]; then
+            verdict="HIGH"; verdict_reason="${semver_reason}; risk keywords found in release notes"
+          elif [ "$keyword_hit" = "0" ] && [ "$verdict" = "MEDIUM" ] && [ -n "$release_notes" ]; then
+            verdict="MEDIUM"; verdict_reason="${semver_reason}; no risk keywords found"
+          elif [ "$keyword_hit" = "0" ] && [ "$verdict" = "LOW" ]; then
+            verdict="LOW"; verdict_reason="${semver_reason}; no risk keywords found"
+          fi
+
+          echo "verdict=$verdict  reason=$verdict_reason"
+
+          # ── 7. Compose the PR comment ────────────────────────────────────────
+          # Choose emoji badge
+          badge="🟢 LOW"
+          [ "$verdict" = "MEDIUM" ] && badge="🟡 MEDIUM"
+          [ "$verdict" = "HIGH"   ] && badge="🔴 HIGH"
+
+          # Format matched risk-keyword lines
+          matched_block=""
+          if [ -n "$matched_lines" ]; then
+            matched_block=$(printf '%s\n' "$matched_lines" | head -8 | sed 's/^/> /')
+          fi
+
+          # Build the registry/docs link label
+          if [[ "$ECOSYSTEM" == "pip" ]]; then
+            pkg_link_label="PyPI page"
+          else
+            pkg_link_label="npm page"
+          fi
+
+          {
+            echo "## 🔎 Changelog-risk review — \`${pkg}\` ${old_ver}→${new_ver}"
+            echo ""
+            echo "**Risk verdict: ${badge}**"
+            echo ""
+            echo "**Reason:** ${verdict_reason}"
+            echo ""
+            if [ -n "$matched_lines" ]; then
+              echo "**Matched risk signals in release notes:**"
+              echo ""
+              echo "$matched_block"
+              echo ""
+            fi
+            echo "**Links:**"
+            echo "- [${pkg_link_label}](${npm_page})"
+            if [ -n "$compare_url" ]; then
+              echo "- [Compare ${old_ver}→${new_ver}](${compare_url})"
+            fi
+            if [ -n "$gh_owner" ] && [ -n "$gh_repo_name" ]; then
+              echo "- [GitHub releases](https://github.com/${gh_owner}/${gh_repo_name}/releases)"
+            fi
+            echo ""
+            if [ -z "$release_notes" ]; then
+              echo "> _No GitHub release notes found for this version range — assessed from semver heuristic only._"
+            else
+              echo "> _Scanned $(echo "$release_notes" | wc -l) lines of release notes in range \`${old_ver}\`→\`${new_ver}\`._"
+            fi
+            echo ""
+            echo "> _Changelog-risk gate v1 — heuristic only, no AI dependency._"
+          } > /tmp/cl-body.md
+
+          gh pr comment "$num" --repo "$GITHUB_REPOSITORY" --body-file /tmp/cl-body.md 2>/dev/null || true
+
+          # ── 8. Labels ────────────────────────────────────────────────────────
+          lv=$(echo "$verdict" | tr '[:upper:]' '[:lower:]')
+          label_color="0e8a16"  # green=LOW
+          [ "$lv" = "medium" ] && label_color="fbca04"
+          [ "$lv" = "high"   ] && label_color="d93f0b"
+
+          gh label create "changelog:low"    --repo "$GITHUB_REPOSITORY" --color 0e8a16 \
+            --description "Changelog gate: low-risk version bump"    2>/dev/null || true
+          gh label create "changelog:medium" --repo "$GITHUB_REPOSITORY" --color fbca04 \
+            --description "Changelog gate: medium-risk version bump" 2>/dev/null || true
+          gh label create "changelog:high"   --repo "$GITHUB_REPOSITORY" --color d93f0b \
+            --description "Changelog gate: high-risk version bump — needs human review" 2>/dev/null || true
+
+          # Remove all changelog:* labels first (idempotent re-runs), then add the right one
+          gh pr edit "$num" --repo "$GITHUB_REPOSITORY" \
+            --remove-label "changelog:low" --remove-label "changelog:medium" --remove-label "changelog:high" \
+            2>/dev/null || true
+          gh pr edit "$num" --repo "$GITHUB_REPOSITORY" --add-label "changelog:${lv}" 2>/dev/null || true
+
+          if [ "$verdict" = "HIGH" ]; then
+            gh label create "autopilot:review" --repo "$GITHUB_REPOSITORY" --color fbca04 \
+              --description "Autopilot: needs a human look before merge" 2>/dev/null || true
+            gh pr edit "$num" --repo "$GITHUB_REPOSITORY" \
+              --add-label "autopilot:review" --remove-label "autopilot:ready" 2>/dev/null || true
+            echo "::notice::PR #$num flagged HIGH risk — autopilot:review added."
+          fi
+
   # ---------------- AUTO-FIX (CI red) — needs Codex creds + push token ----------------
   autofix:
     if: ${{ inputs.ci_conclusion == 'failure' }}
