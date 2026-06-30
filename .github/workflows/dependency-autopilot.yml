@@ -167,6 +167,18 @@ jobs:
           [ "$norm" = "dependabot" ] || { echo "::notice::author '$author' not dependabot — skip"; exit 0; }
           echo "Changelog gate: PR #$num '$title'"
 
+          # Idempotent comment: keep ONE changelog-gate comment per PR (delete prior, post fresh),
+          # so CI re-runs (e.g. after an autofix push) don't spam duplicate comments.
+          MARKER="<!-- changelog-gate -->"
+          post_changelog() {
+            local cid
+            for cid in $(gh api "repos/$GITHUB_REPOSITORY/issues/$num/comments" \
+                          -q ".[] | select(.body | contains(\"$MARKER\")) | .id" 2>/dev/null); do
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/comments/$cid" >/dev/null 2>&1 || true
+            done
+            gh pr comment "$num" --repo "$GITHUB_REPOSITORY" --body-file /tmp/cl-body.md 2>/dev/null || true
+          }
+
           # ── 2. Parse the bump from the PR title ─────────────────────────────
           # Single-package: "... bump <pkg> from <old> to <new> ..."
           pkg=""; old_ver=""; new_ver=""
@@ -184,18 +196,18 @@ jobs:
             gh label create "changelog:grouped" --repo "$GITHUB_REPOSITORY" \
               --color ededed --description "Dependabot grouped update: review packages individually" 2>/dev/null || true
             gh pr edit "$num" --repo "$GITHUB_REPOSITORY" --add-label "changelog:grouped" 2>/dev/null || true
-            cat > /tmp/cl-body.md <<'BODY_EOF'
-          ## 🔎 Changelog-risk review — grouped update
-
-          This is a grouped Dependabot update with multiple packages bumped at once.
-          Automated per-package changelog analysis is skipped in v1 for grouped updates.
-
-          **Action:** Review each bumped package individually via its linked compare URL
-          in the PR description, or inspect its releases page on GitHub/npm.
-
-          > _Changelog-risk gate v1 — grouped update pass-through._
-          BODY_EOF
-            gh pr comment "$num" --repo "$GITHUB_REPOSITORY" --body-file /tmp/cl-body.md 2>/dev/null || true
+            {
+              echo "$MARKER"
+              echo "## 🔎 Changelog-risk review — grouped update"
+              echo ""
+              echo "This is a grouped Dependabot update with multiple packages bumped at once."
+              echo "Automated per-package changelog analysis is skipped in v1 for grouped updates."
+              echo ""
+              echo "**Action:** Review each bumped package individually via its compare URL in the PR description, or its releases page on GitHub/npm."
+              echo ""
+              echo "> _Changelog-risk gate v1 — grouped update pass-through._"
+            } > /tmp/cl-body.md
+            post_changelog
             exit 0
           fi
 
@@ -384,6 +396,7 @@ jobs:
           fi
 
           {
+            echo "$MARKER"
             echo "## 🔎 Changelog-risk review — \`${pkg}\` ${old_ver}→${new_ver}"
             echo ""
             echo "**Risk verdict: ${badge}**"
@@ -414,7 +427,7 @@ jobs:
             echo "> _Changelog-risk gate v1 — heuristic only, no AI dependency._"
           } > /tmp/cl-body.md
 
-          gh pr comment "$num" --repo "$GITHUB_REPOSITORY" --body-file /tmp/cl-body.md 2>/dev/null || true
+          post_changelog
 
           # ── 8. Labels ────────────────────────────────────────────────────────
           lv=$(echo "$verdict" | tr '[:upper:]' '[:lower:]')
