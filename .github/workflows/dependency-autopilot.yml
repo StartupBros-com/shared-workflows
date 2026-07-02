@@ -103,7 +103,9 @@ jobs:
 
           # --- classify risk tier ---
           tier="review"; reason="unclassified"
-          if [[ "$BRANCH" == *"minor-and-patch"* || "$BRANCH" == *"github-actions"* ]]; then
+          # NB: dependabot names GHA branches dependabot/github_actions/... (underscore),
+          # not github-actions — match both or GHA bumps misclassify as review.
+          if [[ "$BRANCH" == *"minor-and-patch"* || "$BRANCH" == *"github-actions"* || "$BRANCH" == *"github_actions"* ]]; then
             tier="safe"; reason="grouped minor/patch"
           elif [[ "$title" =~ from\ ([0-9]+)\.([0-9]+)\.[0-9]+.*to\ ([0-9]+)\.([0-9]+)\.[0-9]+ ]]; then
             fM="${BASH_REMATCH[1]}"; fm="${BASH_REMATCH[2]}"; tM="${BASH_REMATCH[3]}"; tm="${BASH_REMATCH[4]}"
