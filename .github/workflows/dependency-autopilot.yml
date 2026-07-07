@@ -16,8 +16,10 @@ name: Dependency Autopilot (reusable)
 # merging. Flip a repo to `mode: automerge` once its CI is trustworthy.
 #
 # SECURITY (callable from PUBLIC repos, so the guards are load-bearing):
-#   * Acts only on author == dependabot[bot] (gh: 'app/dependabot') AND
-#     isCrossRepository == false. A spoofed `dependabot/*` fork branch is rejected.
+#   * Acts only on a trusted dep-bot author: dependabot[bot] (gh: 'app/dependabot') OR the
+#     org's own self-hosted Renovate app 'app/startupbros-autopilot'; AND isCrossRepository
+#     == false. Both are non-forgeable app identities, so a spoofed `dependabot/*` or
+#     `renovate/*` fork branch is rejected by the same-repo guard.
 #   * Auto-fix checks out with persist-credentials:false, runs Codex network-
 #     sandboxed, and refuses to commit lockfile/manifest/workflow edits.
 #   * No long-lived secret is needed for triage/merge (default GITHUB_TOKEN).
@@ -65,7 +67,7 @@ jobs:
       pull-requests: write      # labels
       actions: read             # read sibling CI runs
     steps:
-      - name: Classify a genuine Dependabot PR and label (merge only in automerge mode)
+      - name: Classify a genuine dep-bot PR and label (merge only in automerge mode)
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ inputs.pr_branch }}
@@ -82,10 +84,13 @@ jobs:
           echo "PR #$num by '$author' (cross-repo=$xrepo): $title"
 
           # --- HARD GUARDS (critical on public repos) ---
-          # gh returns the bot login as 'app/dependabot' on runners — normalize both forms.
+          # gh returns bot logins as 'app/<name>' on runners; normalize the app/ and [bot] forms.
+          # Trusted dep bots: Dependabot, plus the org's OWN self-hosted Renovate app
+          # (app/startupbros-autopilot). Both are non-forgeable app identities; with the
+          # same-repo guard below, a fork branch cannot spoof either.
           norm="${author#app/}"; norm="${norm%\[bot\]}"
-          [ "$norm" = "dependabot" ] || { echo "::notice::author '$author' not dependabot — skip"; exit 0; }
-          [ "$xrepo" = "false" ] || { echo "::notice::cross-repository PR — skip"; exit 0; }
+          case "$norm" in dependabot|startupbros-autopilot) : ;; *) { echo "::notice::author '$author' not a trusted dep bot, skip"; exit 0; } ;; esac
+          [ "$xrepo" = "false" ] || { echo "::notice::cross-repository PR, skip"; exit 0; }
 
           # --- are ALL pull_request CI runs on this commit green? (actions:read) ---
           allgreen=1
@@ -182,9 +187,10 @@ jobs:
           xrepo=$(jq -r '.[0].isCrossRepository' /tmp/pr.json)
           base=$(jq -r '.[0].baseRefName' /tmp/pr.json)
           pr_sha=$(jq -r '.[0].headRefOid' /tmp/pr.json)
-          # HARD GUARDS — only genuine, same-repo Dependabot PRs (load-bearing on public repos).
+          # HARD GUARDS: only genuine, same-repo PRs from a trusted dep bot (Dependabot or the
+          # org's own self-hosted Renovate app). Load-bearing on public repos.
           # A guard hit here is anomalous (shouldn't reach autofix), so fail loudly.
-          [ "$norm" = "dependabot" ] || { echo "::error::author '$author' is not dependabot"; exit 1; }
+          case "$norm" in dependabot|startupbros-autopilot) : ;; *) { echo "::error::author '$author' is not a trusted dep bot"; exit 1; } ;; esac
           [ "$xrepo" = "false" ]     || { echo "::error::cross-repository PR not allowed"; exit 1; }
           [ "$base" = "main" ]       || { echo "::error::base must be main, got '$base'"; exit 1; }
           # FRESHNESS — the failed run must correspond to the CURRENT PR head; if the branch
