@@ -47,6 +47,16 @@ on:
         required: false
         default: "queue"
         type: string
+      runner:
+        description: >-
+          runs-on label for both jobs. Public callers keep the default
+          (GitHub-hosted is free and unmetered for public repos). Private
+          callers pass a Blacksmith label (e.g. blacksmith-2vcpu-ubuntu-2404)
+          so the loop survives the org's included-minutes quota exhausting
+          (2026-07 outage: every private caller was dead for a week).
+        required: false
+        default: "ubuntu-latest"
+        type: string
     secrets:
       APP_ID:
         required: false
@@ -59,7 +69,7 @@ jobs:
   # ---------------- TRIAGE (CI green): classify risk, label, optionally merge ----------------
   triage:
     if: ${{ inputs.ci_conclusion == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     permissions:
       contents: write          # merge (automerge mode only)
       pull-requests: write      # labels
@@ -145,7 +155,7 @@ jobs:
   # ---------------- AUTO-FIX (CI red) — needs Codex creds + push token ----------------
   autofix:
     if: ${{ inputs.ci_conclusion == 'failure' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     # One fix attempt per PR branch at a time — a second CI failure won't race a
     # fix already in flight (don't cancel: let the running fix finish + push).
