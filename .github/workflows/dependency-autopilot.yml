@@ -16,8 +16,10 @@ name: Dependency Autopilot (reusable)
 # merging. Flip a repo to `mode: automerge` once its CI is trustworthy.
 #
 # SECURITY (callable from PUBLIC repos, so the guards are load-bearing):
-#   * Acts only on author == dependabot[bot] (gh: 'app/dependabot') AND
-#     isCrossRepository == false. A spoofed `dependabot/*` fork branch is rejected.
+#   * Acts only on a trusted dep-bot author: dependabot[bot] (gh: 'app/dependabot') OR the
+#     org's own self-hosted Renovate app 'app/startupbros-autopilot'; AND isCrossRepository
+#     == false. Both are non-forgeable app identities, so a spoofed `dependabot/*` or
+#     `renovate/*` fork branch is rejected by the same-repo guard.
 #   * Auto-fix checks out with persist-credentials:false, runs Codex network-
 #     sandboxed, and refuses to commit lockfile/manifest/workflow edits.
 #   * No long-lived secret is needed for triage/merge (default GITHUB_TOKEN).
@@ -75,7 +77,7 @@ jobs:
       pull-requests: write      # labels
       actions: read             # read sibling CI runs
     steps:
-      - name: Classify a genuine Dependabot PR and label (merge only in automerge mode)
+      - name: Classify a genuine dep-bot PR and label (merge only in automerge mode)
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ inputs.pr_branch }}
@@ -87,15 +89,22 @@ jobs:
           num=$(jq -r '.[0].number // empty' /tmp/prs.json)
           [ -n "$num" ] || { echo "No open PR for $BRANCH"; exit 0; }
           author=$(jq -r '.[0].author.login' /tmp/prs.json)
+          is_bot=$(jq -r '.[0].author.is_bot' /tmp/prs.json)
           xrepo=$(jq -r '.[0].isCrossRepository' /tmp/prs.json)
           title=$(jq -r '.[0].title' /tmp/prs.json)
-          echo "PR #$num by '$author' (cross-repo=$xrepo): $title"
+          echo "PR #$num by '$author' (bot=$is_bot cross-repo=$xrepo): $title"
 
           # --- HARD GUARDS (critical on public repos) ---
-          # gh returns the bot login as 'app/dependabot' on runners — normalize both forms.
+          # Assert a genuine App/Bot actor (is_bot) AND an allowlisted login. is_bot is essential:
+          # normalizing away 'app/' collapses the App 'app/startupbros-autopilot' and a User named
+          # 'startupbros-autopilot' to the same string, so a bare-login match alone would trust a
+          # colliding User. The allowlist restricts to our two trusted dep bots (Dependabot, and
+          # the org's OWN self-hosted Renovate app). The same-repo guard blocks fork spoofing.
+          # gh returns bot logins as 'app/<name>' on runners; normalize the app/ and [bot] forms.
           norm="${author#app/}"; norm="${norm%\[bot\]}"
-          [ "$norm" = "dependabot" ] || { echo "::notice::author '$author' not dependabot — skip"; exit 0; }
-          [ "$xrepo" = "false" ] || { echo "::notice::cross-repository PR — skip"; exit 0; }
+          [ "$is_bot" = "true" ] || { echo "::notice::author '$author' is not a bot/app, skip"; exit 0; }
+          case "$norm" in dependabot|startupbros-autopilot) : ;; *) { echo "::notice::author '$author' not a trusted dep bot, skip"; exit 0; } ;; esac
+          [ "$xrepo" = "false" ] || { echo "::notice::cross-repository PR, skip"; exit 0; }
 
           # --- are ALL pull_request CI runs on this commit green? (actions:read) ---
           allgreen=1
@@ -188,13 +197,18 @@ jobs:
           num=$(jq -r '.[0].number // empty' /tmp/pr.json)
           [ -n "$num" ] || skip "no open PR for $BRANCH (closed/merged); skipping."
           author=$(jq -r '.[0].author.login' /tmp/pr.json)
+          is_bot=$(jq -r '.[0].author.is_bot' /tmp/pr.json)
           norm="${author#app/}"; norm="${norm%\[bot\]}"
           xrepo=$(jq -r '.[0].isCrossRepository' /tmp/pr.json)
           base=$(jq -r '.[0].baseRefName' /tmp/pr.json)
           pr_sha=$(jq -r '.[0].headRefOid' /tmp/pr.json)
-          # HARD GUARDS — only genuine, same-repo Dependabot PRs (load-bearing on public repos).
-          # A guard hit here is anomalous (shouldn't reach autofix), so fail loudly.
-          [ "$norm" = "dependabot" ] || { echo "::error::author '$author' is not dependabot"; exit 1; }
+          # HARD GUARDS: genuine App/Bot actor (is_bot) + allowlisted login + same-repo + base
+          # main. is_bot rules out a User with a slug colliding with our app name (a bare-login
+          # match alone would trust them); the allowlist restricts to our two trusted dep bots.
+          # Load-bearing on public repos. A guard hit here is anomalous (shouldn't reach autofix),
+          # so fail loudly.
+          [ "$is_bot" = "true" ]     || { echo "::error::author '$author' is not a bot/app"; exit 1; }
+          case "$norm" in dependabot|startupbros-autopilot) : ;; *) { echo "::error::author '$author' is not a trusted dep bot"; exit 1; } ;; esac
           [ "$xrepo" = "false" ]     || { echo "::error::cross-repository PR not allowed"; exit 1; }
           [ "$base" = "main" ]       || { echo "::error::base must be main, got '$base'"; exit 1; }
           # FRESHNESS — the failed run must correspond to the CURRENT PR head; if the branch
