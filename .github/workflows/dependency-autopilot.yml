@@ -126,6 +126,30 @@ jobs:
           # not github-actions — match both or GHA bumps misclassify as review.
           if [[ "$BRANCH" == *"minor-and-patch"* || "$BRANCH" == *"github-actions"* || "$BRANCH" == *"github_actions"* ]]; then
             tier="safe"; reason="grouped minor/patch"
+          # Renovate vulnerability PRs are titled "Update dependency X@<range> to
+          # >=Y [SECURITY]" — a RANGE, not the "from A.B.C to D.E.F" shape below.
+          # They therefore never matched and landed on the generic
+          # "unclassified" reason, which reads like a parser gap rather than a
+          # deliberate hold. Classify them explicitly: still review (a security
+          # bump crossing a major line is exactly what a human should look at),
+          # but with an honest reason and the versions named.
+          elif [[ "$title" == *"[SECURITY]"* ]]; then
+            tier="review"
+            # Anchor at the dependency's own version (right after @). A greedy
+            # match reads the RANGE'S UPPER BOUND as the "from" major: for
+            # "next@>=15.6.0-canary.0 <16.1.5 to >=16.3.0" that yields 16->16
+            # and hides a real major-line jump. Caught by a fixture built from
+            # the live titles.
+            if [[ "$title" =~ @[^0-9]*([0-9]+)\.[0-9]+.*\ to\ \>?=?v?([0-9]+) ]]; then
+              sfM="${BASH_REMATCH[1]}"; stM="${BASH_REMATCH[2]}"
+              if [ "$sfM" != "$stM" ]; then
+                reason="security advisory, major line ${sfM}.x -> ${stM}.x — human review"
+              else
+                reason="security advisory within ${sfM}.x — human review"
+              fi
+            else
+              reason="security advisory — human review"
+            fi
           elif [[ "$title" =~ from\ ([0-9]+)\.([0-9]+)\.[0-9]+.*to\ ([0-9]+)\.([0-9]+)\.[0-9]+ ]]; then
             fM="${BASH_REMATCH[1]}"; fm="${BASH_REMATCH[2]}"; tM="${BASH_REMATCH[3]}"; tm="${BASH_REMATCH[4]}"
             if [ "$fM" != "$tM" ]; then
