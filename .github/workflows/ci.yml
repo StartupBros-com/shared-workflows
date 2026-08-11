@@ -1,0 +1,36 @@
+name: CI
+
+# The tier classifier is a shell block inside a reusable workflow consumed by
+# every repo in the org, so a misclassification ships everywhere at once and is
+# invisible until a PR is labelled wrong. It had no test because nothing could
+# execute a `run:` block in isolation. tests/classify-tier.test.sh mirrors that
+# logic against real PR titles; this runs it.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c
+        with:
+          persist-credentials: false
+
+      - name: Classifier fixtures
+        run: bash tests/classify-tier.test.sh
+
+      - name: Workflows parse as YAML
+        run: |
+          for wf in .github/workflows/*.yml; do
+            python3 -c "import sys,yaml; yaml.safe_load(open(sys.argv[1]))" "$wf" \
+              || { echo "::error::$wf is not valid YAML"; exit 1; }
+            echo "ok - $wf"
+          done
