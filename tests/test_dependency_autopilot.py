@@ -14,6 +14,7 @@ from autopilot_harness import (
     WORKFLOW,
     RealGitHarness,
     ShellHarness,
+    lagging_cases,
     step,
     trusted_pr,
 )
@@ -431,18 +432,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(outputs["outcome"], "green_safe")
         self.assertTrue(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
 
-    def test_triage_fails_closed_to_review_when_trigger_currency_is_indeterminate(self):
-        # No inventory entry for the trigger's own workflow_id: currency is
-        # unprovable either way. Fails closed TOWARD forcing review, never
-        # toward a silent promotion to green off inconclusive data.
-        harness = self.harness(
-            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
-            run=RUN | {"workflowDatabaseId": 1, "number": 1, "conclusion": "cancelled"},
-            runs={"workflow_runs": [{"workflow_id": 2, "run_number": 1, "conclusion": "success"}]},
-        )
-        self.success(harness.run("triage", "triage", CI_CONCLUSION="cancelled", MODE="automerge"))
-        self.assertEqual(harness.outputs()["outcome"], "review_held")
-        self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+    def test_triage_lagging_or_missing_inventory_never_proves_green(self):
+        # Merge-safety regression: cancelled #11 with a lagging/missing list
+        # entry must fail closed to review, never merge.
+        for case_name, entry in lagging_cases("success"):
+            with self.subTest(case=case_name):
+                harness = self.harness(
+                    prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+                    run=RUN | {"workflowDatabaseId": 1, "number": 11, "conclusion": "cancelled"},
+                    runs={"workflow_runs": [entry]},
+                )
+                self.success(harness.run("triage", "triage", CI_CONCLUSION="cancelled", MODE="automerge"))
+                self.assertEqual(harness.outputs()["outcome"], "review_held")
+                self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
 
     def test_non_success_sibling_reconciles_to_review_held_instead_of_stranding_the_hold(self):
         # A prior event would have held this as ci_unresolved awaiting the
@@ -695,18 +697,20 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(harness.outputs()["outcome"], "admitted")
         self.assertEqual(harness.outputs()["ok"], "1")
 
-    def test_autofix_fails_closed_to_no_repair_when_trigger_currency_is_indeterminate(self):
-        # No inventory entry for the trigger's own workflow_id: currency is
-        # unprovable either way. Fails closed TOWARD NOT repairing — the
-        # exact P1 this guards against.
-        harness = self.harness(
-            run=RUN | {"workflowDatabaseId": 1, "number": 1, "conclusion": "failure"},
-            runs={"workflow_runs": [{"workflow_id": 2, "run_number": 1, "conclusion": "success"}]},
-        )
-        self.success(harness.run("autofix", "pre", CI_CONCLUSION="failure"))
-        self.assertEqual(harness.outputs()["outcome"], "stale_rejected")
-        self.assertEqual(harness.outputs()["ok"], "0")
-        self.assertFalse(any(c[0] == "codex" for c in harness.calls()))
+    def test_autofix_lagging_or_missing_inventory_does_not_repair(self):
+        # Retries exhaust without proving current/superseded: Codex must not
+        # run, but the PR still reaches handoff, not the skipped `stale_rejected`.
+        for case_name, entry in lagging_cases("success"):
+            with self.subTest(case=case_name):
+                harness = self.harness(
+                    run=RUN | {"workflowDatabaseId": 1, "number": 11, "conclusion": "failure"},
+                    runs={"workflow_runs": [entry]},
+                )
+                self.success(harness.run("autofix", "pre", CI_CONCLUSION="failure", AUTOPILOT_CURRENCY_RETRY_SECONDS="0"))
+                self.assertEqual(harness.outputs()["outcome"], "currency_indeterminate")
+                self.assertEqual(harness.outputs()["ok"], "0")
+                self.assertEqual(self.mutation_calls(harness), [])
+                self.assertFalse(any(c[0] == "codex" for c in harness.calls()))
 
     def test_two_consecutive_red_completions_produce_exactly_one_repair_then_a_review_owner(self):
         harness = self.harness(changed_files=["src/app.ts"], remote_sha=OLD_SHA, pushed_sha=NEW_SHA)
@@ -892,7 +896,8 @@ class WorkflowTests(unittest.TestCase):
 
     def test_red_unresolved_outcomes_queue_after_independent_revalidation(self):
         for outcome, status in (("no_changes", "success"), ("unavailable_credentials", "success"),
-                                ("failed_execution", "failure"), ("already_repaired", "success")):
+                                ("failed_execution", "failure"), ("already_repaired", "success"),
+                                ("currency_indeterminate", "success")):
             with self.subTest(outcome=outcome):
                 harness = self.harness()
                 self.success(self.red_handoff(harness, outcome, AUTOFIX_RESULT=status))

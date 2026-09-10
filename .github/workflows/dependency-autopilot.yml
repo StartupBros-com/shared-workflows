@@ -161,18 +161,37 @@ jobs:
           t_attempt=$(jq -r '.attempt' "$run_file")
           t_concl=$(jq -r '.conclusion // ""' "$run_file")
           l_num=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | .run_number ] | first // empty' <<<"$latest")
-          # Proven superseded only when the inventory has an entry for this
-          # workflow_id AND it disagrees (a higher run_number, or a live
-          # conclusion that no longer matches the trigger). Fail CLOSED
-          # toward the pre-existing conservative behavior when currency
-          # cannot be established (no entry for this workflow_id at all,
-          # e.g. an exotic pagination gap): an unproven trigger keeps
-          # forcing review below exactly as it always has, never a silent
-          # promotion to green off inconclusive data.
+          # The run-list API is eventually consistent and can lag behind
+          # this direct `gh run view` read, so a run_number mismatch alone
+          # does NOT prove supersession — it can equally mean the list has
+          # simply not caught up yet. Three states, not two:
+          #   superseded - PROVEN: either this run's own live conclusion no
+          #                longer matches the trigger (a rerun updated it in
+          #                place), or the inventory shows a STRICTLY NEWER
+          #                run_number for this workflow_id (l_num > t_num).
+          #                Either is a different, more current event, so
+          #                deferring to the fresh inventory is not a race.
+          #   lagging    - no inventory entry at all for this workflow_id,
+          #                or the inventory's run_number is LOWER than the
+          #                trigger's own (l_num < t_num): the list has not
+          #                caught up. Currency is unprovable either way —
+          #                this is NOT supersession, and must never let a
+          #                stale earlier run establish a green inventory.
+          #   current    - l_num equals t_num and the live conclusion
+          #                matches the trigger, exactly as before currency
+          #                checking existed.
           trigger_superseded=0
-          if [ -n "$l_num" ] && { [ "$t_num" != "$l_num" ] || [ "$t_concl" != "$CI_CONCLUSION" ]; }; then
+          trigger_lagging=0
+          if [ "$t_concl" != "$CI_CONCLUSION" ]; then
             trigger_superseded=1
-            echo "::notice::triggering run $RUN_ID (workflow $t_wf, run $t_num attempt $t_attempt) is superseded: now concludes '$t_concl' and the latest run for that workflow at this head is #$l_num; reconciling from the fresh inventory instead of the stale trigger conclusion."
+            echo "::notice::triggering run $RUN_ID (workflow $t_wf, run $t_num attempt $t_attempt) is superseded: its live conclusion is now '$t_concl', not the triggering '$CI_CONCLUSION'; reconciling from the fresh inventory instead of the stale trigger conclusion."
+          elif [ -z "$l_num" ]; then
+            trigger_lagging=1
+          elif [ "$l_num" -gt "$t_num" ]; then
+            trigger_superseded=1
+            echo "::notice::triggering run $RUN_ID (workflow $t_wf, run $t_num attempt $t_attempt) is superseded: the latest run for that workflow at this head is now #$l_num; reconciling from the fresh inventory instead of the stale trigger conclusion."
+          elif [ "$l_num" -lt "$t_num" ]; then
+            trigger_lagging=1
           fi
           total=$(jq 'length' <<<"$latest")
           successes=$(jq '[ .[] | select(.conclusion == "success") ] | length' <<<"$latest")
@@ -185,6 +204,16 @@ jobs:
           # neutral runs can complete reconciliation, but cannot establish a
           # green inventory without at least one genuine successful workflow.
           [ "$successes" -eq 0 ] && allgreen=0
+          # A lagging inventory cannot prove green either, even if every
+          # entry it currently holds looks successful: the list has not
+          # caught up with this trigger's own run_number, so that success
+          # may belong to a stale earlier run, not proof of the current
+          # state. Merging (a privileged action) requires currency to be
+          # POSITIVELY proven, never merely unrefuted.
+          if [ "$trigger_lagging" = "1" ]; then
+            allgreen=0
+            echo "::notice::the run-list inventory for workflow $t_wf at this head has not caught up with run $RUN_ID (its own run $t_num vs. latest known #${l_num:-none}); currency is unproven, so this inventory cannot establish green."
+          fi
 
           # A separate, narrower signal for ci_unresolved vs review_held.
           # `unresolved` means a real future event is still owed for this
@@ -428,36 +457,56 @@ jobs:
           [ "$run_sha" = "$pr_sha" ] || stop stale_rejected "stale failure: run $RUN_ID was for $run_sha but PR #$num is now $pr_sha."
 
           # Trigger currency (see the triage job for the full rationale):
-          # head-SHA equality above is not enough — a rerun of this SAME run
-          # (conclusion updated in place) or a newer separate run of the
-          # same workflow (higher run_number) can supersede this failure
-          # without moving the PR head. Triage does not run for a
-          # repair-set conclusion, so fetch the inventory fresh here too.
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$pr_sha&event=pull_request&per_page=100" \
-            --paginate --slurp > "$runs_file"
-          latest=$(jq '[ .[] | .workflow_runs[] ] | group_by(.workflow_id) | map(max_by(.run_number))' "$runs_file")
+          # head-SHA equality above is not enough, and a run_number
+          # mismatch against the (eventually consistent) run-list API alone
+          # does not prove supersession — it can equally mean the list has
+          # not caught up yet. Triage does not run for a repair-set
+          # conclusion, so fetch the inventory fresh here too, retrying a
+          # bounded number of times to let a lagging list catch up before
+          # treating currency as unprovable.
           t_wf=$(jq -r '.workflowDatabaseId' "$run_file")
           t_num=$(jq -r '.number' "$run_file")
           t_attempt=$(jq -r '.attempt' "$run_file")
           t_concl=$(jq -r '.conclusion // ""' "$run_file")
-          l_num=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | .run_number ] | first // empty' <<<"$latest")
-          # Fail CLOSED toward NOT repairing: only a run POSITIVELY proven
-          # current (found in the fresh inventory, still the max run_number
-          # for its own workflow_id, and its live conclusion still matches
-          # the trigger) is allowed to admit repair. Both a proven-superseded
-          # run and an indeterminate one (no inventory entry for this
-          # workflow_id at all) stop here — running Codex, consuming the
-          # single repair attempt, or pushing changes against a head that
-          # may already be green is the exact P1 this guards against. The
-          # actually-latest run's own completion event is the invocation
-          # responsible for reconciling the current state, not this one.
-          trigger_current=0
-          if [ -n "$l_num" ] && [ "$t_num" = "$l_num" ] && [ "$t_concl" = "$CI_CONCLUSION" ]; then
-            trigger_current=1
-          fi
-          if [ "$trigger_current" != "1" ]; then
-            stop stale_rejected "stale failure: run $RUN_ID (workflow $t_wf, run $t_num attempt $t_attempt, now concludes '$t_concl') is no longer the latest run for its workflow at $pr_sha; skipping auto-fix so the current invocation for this head reconciles instead."
-          fi
+          retry_seconds="${AUTOPILOT_CURRENCY_RETRY_SECONDS:-5}"
+          currency="lagging"
+          attempt=1
+          while [ "$attempt" -le 3 ]; do
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$pr_sha&event=pull_request&per_page=100" \
+              --paginate --slurp > "$runs_file"
+            latest=$(jq '[ .[] | .workflow_runs[] ] | group_by(.workflow_id) | map(max_by(.run_number))' "$runs_file")
+            l_num=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | .run_number ] | first // empty' <<<"$latest")
+            if [ "$t_concl" != "$CI_CONCLUSION" ] || { [ -n "$l_num" ] && [ "$l_num" -gt "$t_num" ]; }; then
+              currency="superseded"; break
+            fi
+            if [ -n "$l_num" ] && [ "$l_num" -eq "$t_num" ]; then
+              currency="current"; break
+            fi
+            attempt=$((attempt + 1))
+            [ "$attempt" -le 3 ] && sleep "$retry_seconds"
+          done
+          # Fail CLOSED toward NOT repairing on every state but proven
+          # current — running Codex, consuming the single repair attempt, or
+          # pushing changes against a head that may already be green is the
+          # exact P1 this guards against. A proven-superseded run (a
+          # strictly newer run_number, or this run's own live conclusion no
+          # longer matching the trigger) means a different, more current
+          # event already owns reconciliation, so it reconciles as before.
+          # A run that stays lagging/indeterminate after the bounded
+          # retries above (no inventory entry for this workflow_id, or the
+          # list still behind this run's own number) is NOT proven either
+          # way — unlike proven supersession, no other event is guaranteed
+          # to reconcile this head, so it must still reach the terminal
+          # handoff as a definite owner instead of being silently dropped.
+          case "$currency" in
+            current) : ;;
+            superseded)
+              stop stale_rejected "stale failure: run $RUN_ID (workflow $t_wf, run $t_num attempt $t_attempt, now concludes '$t_concl') is no longer the latest run for its workflow at $pr_sha; skipping auto-fix so the current invocation for this head reconciles instead."
+              ;;
+            *)
+              stop currency_indeterminate "run $RUN_ID (workflow $t_wf, run $t_num attempt $t_attempt) currency could not be proven after retries; the run-list inventory has not caught up. Skipping auto-fix without running Codex — the unchanged PR still reaches terminal handoff for review."
+              ;;
+          esac
 
           if [ -z "${CODEX_AUTH:-}" ] || [ -z "${APP_ID:-}" ] || [ -z "${APP_PRIVATE_KEY:-}" ]; then
             stop unavailable_credentials "Auto-fix credentials are unavailable; terminal handoff will consider the unresolved red PR."
@@ -660,7 +709,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$PRE_OUTCOME" in
-            unavailable_credentials|stale_rejected|existing_owner|already_repaired)
+            unavailable_credentials|stale_rejected|existing_owner|already_repaired|currency_indeterminate)
               outcome="$PRE_OUTCOME"
               ;;
             admitted)
@@ -768,7 +817,7 @@ jobs:
                   # processed SHA, stranding the repair with no active owner.
                   skip "the repaired head's own CI completion selects the next owner, not this push"
                   ;;
-                no_changes|unavailable_credentials|already_repaired)
+                no_changes|unavailable_credentials|already_repaired|currency_indeterminate)
                   [ "$AUTOFIX_RESULT" = "success" ] || fail "unresolved auto-fix metadata is inconsistent"
                   expected_sha="$AUTOFIX_TRIGGER_SHA"
                   ;;

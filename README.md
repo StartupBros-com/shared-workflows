@@ -22,9 +22,9 @@ Dependabot / Renovate PR -> CI completes
     pushed -> hold for review before publishing, then skip the handoff for this
       SHA; the pushed head re-fires its own CI, and that completion (forced to
       tier=review by the `autopilot:autofixed` label) selects the next owner
-    no changes / unavailable credentials / failed execution / already-repaired ->
-      hand off the unchanged PR only if its identity and source CI can be
-      revalidated
+    no changes / unavailable credentials / failed execution / already-repaired /
+      currency-indeterminate -> hand off the unchanged PR only if its identity
+      and source CI can be revalidated
   RECONCILE (everything not in the repair set — success, skipped, neutral,
       cancelled, stale, or any future conclusion) -> reconcile the latest
       watched-workflow inventory. Only a triggering conclusion that is
@@ -183,6 +183,14 @@ expected, not evidence of a dependency-workflow outage.
   outcome output empty is also inferred as failed execution, but only when the
   job itself reports `failure` and had already bound a PR number and trigger
   SHA before it died; a `cancelled` job or missing binding still fails closed.
+- **Currency indeterminate:** the run-list inventory used to judge whether the
+  triggering run is still current is eventually consistent and can lag behind
+  a direct run read. A run_number mismatch alone never proves supersession —
+  only a strictly newer list entry, or the run's own live conclusion no
+  longer matching the trigger, does. When the bounded retry cannot settle
+  either way, repair is refused (Codex never runs) but the unchanged PR still
+  reaches the terminal handoff, rather than being silently dropped the way a
+  proven-stale target is.
 - **Existing owner / stale or rejected target:** no handoff. Drafts, human
   assignees, pending User or Team review requests, and `pro-review`,
   `skip-pro-review`, `claimed`, or `loop-run` labels prevent a second writer from

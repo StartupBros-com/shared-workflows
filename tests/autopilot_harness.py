@@ -103,6 +103,16 @@ def trusted_pr(**changes):
     return pr
 
 
+def lagging_cases(conclusion):
+    """Run-list inventory entries that cannot prove trigger #11/workflow 1
+    current: no entry for that workflow_id, and a stale entry whose
+    run_number (10) still lags the trigger's own (11)."""
+    return (
+        ("missing", {"workflow_id": 2, "run_number": 1, "conclusion": conclusion}),
+        ("lagging", {"workflow_id": 1, "run_number": 10, "conclusion": conclusion}),
+    )
+
+
 FAKE_CLI = r'''#!/usr/bin/env python3
 import copy
 import json
