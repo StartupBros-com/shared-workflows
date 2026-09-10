@@ -5,7 +5,6 @@ import os
 import shutil
 import subprocess
 import tempfile
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -24,11 +23,6 @@ RUN = {
 
 def step(job, step_id):
     return next(item for item in WORKFLOW["jobs"][job]["steps"] if item.get("id") == step_id)
-
-
-def iso_minutes_ago(minutes):
-    """An `updated_at`-shaped timestamp `minutes` before now, for grace-window tests."""
-    return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def make_shell_harness(testcase, **config):
@@ -160,7 +154,20 @@ if name == "gh":
     elif args[:2] == ["run", "view"] and "--log-failed" in args:
         print(config.get("failed_log", "tests failed"), end="")
     elif args[:2] == ["run", "view"]:
-        print(json.dumps(config.get("run", {})))
+        # Trigger-currency defaults: a test that does not care about
+        # currency (nearly all of them — this behavior predates currency
+        # checking) gets a trigger that is trivially "current" by
+        # construction — its live conclusion tracks whatever CI_CONCLUSION
+        # this specific step invocation used, and its workflow/run identity
+        # matches the default single-entry run inventory below. A test
+        # exercising currency itself overrides "run" and/or "runs" to make
+        # them disagree.
+        run_cfg = dict(config.get("run", {}))
+        run_cfg.setdefault("conclusion", os.environ.get("CI_CONCLUSION", "success"))
+        run_cfg.setdefault("workflowDatabaseId", 1)
+        run_cfg.setdefault("number", 1)
+        run_cfg.setdefault("attempt", 1)
+        print(json.dumps(run_cfg))
     elif args[0] == "api":
         endpoint = args[1]
         if "/comments" in endpoint:

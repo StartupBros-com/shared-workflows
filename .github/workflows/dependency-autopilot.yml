@@ -130,7 +130,8 @@ jobs:
           pending_reviews=$(jq '.[0].reviewRequests // [] | length' "$prs_file")
           [ "$pending_reviews" = "0" ] || stop existing_owner "PR #$num has a pending review request; leaving it to that owner."
 
-          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json event,headSha,url > "$run_file"
+          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --json event,headSha,url,conclusion,number,attempt,workflowDatabaseId > "$run_file"
           run_event=$(jq -r '.event // ""' "$run_file")
           run_sha=$(jq -r '.headSha // ""' "$run_file")
           [ "$run_event" = "pull_request" ] || stop stale_rejected "run $RUN_ID is not pull_request provenance; skipping."
@@ -144,6 +145,35 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$pr_sha&event=pull_request&per_page=100" \
             --paginate --slurp > "$runs_file"
           latest=$(jq '[ .[] | .workflow_runs[] ] | group_by(.workflow_id) | map(max_by(.run_number))' "$runs_file")
+
+          # Trigger currency: head-SHA equality (above) is necessary but not
+          # sufficient. A rerun of this SAME run updates its conclusion in
+          # place with no PR-head change, and a newer separate run of the
+          # same workflow can complete with a higher run_number — either can
+          # supersede the trigger without the PR ever moving. Re-fetch this
+          # run's own workflow identity, run number, attempt, and CURRENT
+          # conclusion (never trust inputs.ci_conclusion as still accurate)
+          # and compare against the freshly fetched inventory above: current
+          # only when this run is still the max run_number for its own
+          # workflow_id AND its live conclusion still matches the trigger.
+          t_wf=$(jq -r '.workflowDatabaseId' "$run_file")
+          t_num=$(jq -r '.number' "$run_file")
+          t_attempt=$(jq -r '.attempt' "$run_file")
+          t_concl=$(jq -r '.conclusion // ""' "$run_file")
+          l_num=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | .run_number ] | first // empty' <<<"$latest")
+          # Proven superseded only when the inventory has an entry for this
+          # workflow_id AND it disagrees (a higher run_number, or a live
+          # conclusion that no longer matches the trigger). Fail CLOSED
+          # toward the pre-existing conservative behavior when currency
+          # cannot be established (no entry for this workflow_id at all,
+          # e.g. an exotic pagination gap): an unproven trigger keeps
+          # forcing review below exactly as it always has, never a silent
+          # promotion to green off inconclusive data.
+          trigger_superseded=0
+          if [ -n "$l_num" ] && { [ "$t_num" != "$l_num" ] || [ "$t_concl" != "$CI_CONCLUSION" ]; }; then
+            trigger_superseded=1
+            echo "::notice::triggering run $RUN_ID (workflow $t_wf, run $t_num attempt $t_attempt) is superseded: now concludes '$t_concl' and the latest run for that workflow at this head is #$l_num; reconciling from the fresh inventory instead of the stale trigger conclusion."
+          fi
           total=$(jq 'length' <<<"$latest")
           successes=$(jq '[ .[] | select(.conclusion == "success") ] | length' <<<"$latest")
           bad=$(jq '[ .[] | (.conclusion // "pending") ]
@@ -165,35 +195,16 @@ jobs:
           # completion is expected to route to autofix (a genuine repair
           # attempt) rather than back through here — handing off to review
           # now would race that attempt and could starve it (admission
-          # treats an existing pro-review label as another owner).
-          #
-          # But a failure-like sibling's repair attempt is not guaranteed to
-          # run: its autopilot invocation can die before it ever
-          # establishes ownership (a transient API failure in its handoff
-          # job, a lost runner) — and once that sibling's own completion
-          # event has already fired, nothing will retry it. An unbounded
-          # defer on that conclusion would then hold the PR forever with no
-          # owner. So the defer on a repair-set conclusion is bounded by
-          # that sibling's OWN completion time (`updated_at` — this list
-          # endpoint exposes no dedicated completed_at, and updated_at is
-          # set when the run's status/conclusion last changed). Within
-          # GRACE_SECONDS of that completion we keep deferring exactly as
-          # before — this preserves repair-before-review ordering, the
-          # whole reason the defer exists: reconciling a red inventory to
-          # review_held immediately would label pro-review, and autofix
-          # admission would then refuse it as an existing owner, killing
-          # repair. Past the window with ownership still not established,
-          # that run stops counting as owed and falls through to
-          # review_held so the PR gets a definite owner. A missing or
-          # unparseable `updated_at` is treated as within the window — fail
-          # toward the existing defer, not toward a premature review_held.
-          #
-          # HONEST LIMIT: this bounds the wait only when a LATER watched
-          # completion event arrives to re-run this reconciliation. If the
-          # failed sibling's own completion is the last event that will
-          # ever fire for this head, nothing inside this workflow triggers
-          # again to notice the window has passed. Closing that residual
-          # gap needs a caller-side scheduled sweep; see README.md.
+          # treats an existing pro-review label as another owner). This has
+          # no time bound: a repair-set conclusion is owed for as long as it
+          # stays in the repair set, full stop. A bounded (time-based)
+          # version of this check was tried and reverted — it cannot tell
+          # "the producer died" from "the producer's callback is merely
+          # queued behind this event" in the same FIFO concurrency group,
+          # and guessing wrong breaks repair-before-review ordering by
+          # dropping a still-pending repair and racing it into review. See
+          # README.md's residual-limit section for the caller-side sweep
+          # this still needs for a producer that never delivers.
           #
           # Every other terminal conclusion (success, skipped, neutral,
           # cancelled, stale, or any future value) only ever reconciles
@@ -204,25 +215,10 @@ jobs:
           # review_held, not be labelled ci_unresolved forever waiting on an
           # event that already happened. `allgreen` above is the sole gate
           # on merge eligibility.
-          #
-          # GRACE_SECONDS is set comfortably above the sum of the two job
-          # timeouts a sibling's own repair attempt would need to clear
-          # before establishing ownership: autofix's 30 minutes plus
-          # handoff's 8 minutes (38 total), rounded up to 45 minutes to
-          # leave headroom for runner queueing delay before either job even
-          # starts.
-          GRACE_SECONDS=$((45 * 60))
-          now_epoch=$(date -u +%s)
-          still_owed=$(jq --argjson repair '["failure","timed_out","action_required","startup_failure"]' \
-                    --argjson now "$now_epoch" --argjson grace "$GRACE_SECONDS" '
-                    def within_grace:
-                      (.updated_at // null) as $u
-                      | ($u == null) or (
-                          try (($now - ($u | fromdateiso8601)) <= $grace) catch true
-                        );
+          still_owed=$(jq --argjson repair '["failure","timed_out","action_required","startup_failure"]' '
                     [ .[] | select(
                         .conclusion == null
-                        or ((.conclusion as $c | $repair | any(. == $c)) and within_grace)
+                        or (.conclusion as $c | $repair | any(. == $c))
                       ) ] | length' <<<"$latest")
           unresolved=0
           [ "$total" -eq 0 ] && unresolved=1
@@ -287,14 +283,27 @@ jobs:
           # `bad`/`allgreen` above allow into a green inventory. This is a
           # closed three-value allowlist for "good", not an open list of
           # "bad" values to catch, so cancelled, stale, and any conclusion
-          # GitHub adds later all fall into the same forced-review branch.
-          # Force review the same way an existing auto-fix does, below, even
-          # if the freshly fetched inventory now looks green (e.g. a
-          # superseding rerun already succeeded and this event arrived out
-          # of order).
+          # GitHub adds later all fall into the same forced-review branch —
+          # UNLESS this trigger has been proven superseded (above). A
+          # current cancelled/stale trigger forces review even if the
+          # freshly fetched inventory now looks green, because if it were
+          # still current the `bad`/`allgreen` computation above would
+          # already reflect its own non-success conclusion — this override
+          # exists only to catch a genuinely non-success trigger that the
+          # inventory query raced (e.g. the list endpoint has not yet
+          # caught up with this exact run). A PROVEN superseded trigger is a
+          # different case entirely: the inventory already reflects a
+          # DIFFERENT, more current run for that workflow, so deferring to
+          # it is not a race — forcing review here would be pure cost with
+          # no safety benefit, holding a genuinely green head for a
+          # conclusion that no longer describes anything live.
           case "$CI_CONCLUSION" in
             success|skipped|neutral) : ;;
-            *) tier="review"; reason="${reason}; triggering run concluded '${CI_CONCLUSION}' — not success evidence" ;;
+            *)
+              if [ "$trigger_superseded" != "1" ]; then
+                tier="review"; reason="${reason}; triggering run concluded '${CI_CONCLUSION}' — not success evidence"
+              fi
+              ;;
           esac
           if jq -e 'any(.labels[]?; .name == "autopilot:autofixed")' "$fresh_file" >/dev/null; then
             tier="review"; reason="contains AI-authored auto-fix — human review required"
@@ -356,6 +365,7 @@ jobs:
           APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
           BRANCH: ${{ inputs.pr_branch }}
           RUN_ID: ${{ inputs.ci_run_id }}
+          CI_CONCLUSION: ${{ inputs.ci_conclusion }}
         run: |
           set -euo pipefail
           echo "outcome=failed_execution" >> "$GITHUB_OUTPUT"
@@ -368,6 +378,7 @@ jobs:
 
           prs_file="$RUNNER_TEMP/autofix-prs.json"
           run_file="$RUNNER_TEMP/autofix-run.json"
+          runs_file="$RUNNER_TEMP/autofix-runs.json"
           gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open \
             --json number,author,assignees,reviewRequests,baseRefName,headRefName,headRefOid,isCrossRepository,isDraft,labels,state > "$prs_file"
           count=$(jq 'length' "$prs_file")
@@ -408,12 +419,45 @@ jobs:
           pending_reviews=$(jq '.[0].reviewRequests // [] | length' "$prs_file")
           [ "$pending_reviews" = "0" ] || stop existing_owner "PR #$num has a pending review request; skipping auto-fix."
 
-          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json event,headSha,url > "$run_file"
+          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --json event,headSha,url,conclusion,number,attempt,workflowDatabaseId > "$run_file"
           run_event=$(jq -r '.event // ""' "$run_file")
           run_sha=$(jq -r '.headSha // ""' "$run_file")
           [ "$run_event" = "pull_request" ] || stop stale_rejected "run $RUN_ID is not pull_request provenance; skipping auto-fix."
           [ -n "$run_sha" ] || stop stale_rejected "run $RUN_ID has no head SHA; skipping auto-fix."
           [ "$run_sha" = "$pr_sha" ] || stop stale_rejected "stale failure: run $RUN_ID was for $run_sha but PR #$num is now $pr_sha."
+
+          # Trigger currency (see the triage job for the full rationale):
+          # head-SHA equality above is not enough — a rerun of this SAME run
+          # (conclusion updated in place) or a newer separate run of the
+          # same workflow (higher run_number) can supersede this failure
+          # without moving the PR head. Triage does not run for a
+          # repair-set conclusion, so fetch the inventory fresh here too.
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$pr_sha&event=pull_request&per_page=100" \
+            --paginate --slurp > "$runs_file"
+          latest=$(jq '[ .[] | .workflow_runs[] ] | group_by(.workflow_id) | map(max_by(.run_number))' "$runs_file")
+          t_wf=$(jq -r '.workflowDatabaseId' "$run_file")
+          t_num=$(jq -r '.number' "$run_file")
+          t_attempt=$(jq -r '.attempt' "$run_file")
+          t_concl=$(jq -r '.conclusion // ""' "$run_file")
+          l_num=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | .run_number ] | first // empty' <<<"$latest")
+          # Fail CLOSED toward NOT repairing: only a run POSITIVELY proven
+          # current (found in the fresh inventory, still the max run_number
+          # for its own workflow_id, and its live conclusion still matches
+          # the trigger) is allowed to admit repair. Both a proven-superseded
+          # run and an indeterminate one (no inventory entry for this
+          # workflow_id at all) stop here — running Codex, consuming the
+          # single repair attempt, or pushing changes against a head that
+          # may already be green is the exact P1 this guards against. The
+          # actually-latest run's own completion event is the invocation
+          # responsible for reconciling the current state, not this one.
+          trigger_current=0
+          if [ -n "$l_num" ] && [ "$t_num" = "$l_num" ] && [ "$t_concl" = "$CI_CONCLUSION" ]; then
+            trigger_current=1
+          fi
+          if [ "$trigger_current" != "1" ]; then
+            stop stale_rejected "stale failure: run $RUN_ID (workflow $t_wf, run $t_num attempt $t_attempt, now concludes '$t_concl') is no longer the latest run for its workflow at $pr_sha; skipping auto-fix so the current invocation for this head reconciles instead."
+          fi
 
           if [ -z "${CODEX_AUTH:-}" ] || [ -z "${APP_ID:-}" ] || [ -z "${APP_PRIVATE_KEY:-}" ]; then
             stop unavailable_credentials "Auto-fix credentials are unavailable; terminal handoff will consider the unresolved red PR."

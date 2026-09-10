@@ -14,7 +14,6 @@ from autopilot_harness import (
     WORKFLOW,
     RealGitHarness,
     ShellHarness,
-    iso_minutes_ago,
     step,
     trusted_pr,
 )
@@ -404,6 +403,47 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(harness.outputs()["outcome"], "review_held")
                 self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
 
+    def test_current_cancelled_trigger_still_forces_review(self):
+        # Trigger matches the inventory's max run_number for its workflow_id
+        # (current, not superseded): the cancelled/stale override must still
+        # fire exactly as before currency checking existed.
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            run=RUN | {"workflowDatabaseId": 1, "number": 1, "conclusion": "cancelled"},
+            runs={"workflow_runs": [{"workflow_id": 1, "run_number": 1, "conclusion": "cancelled"}]},
+        )
+        self.success(harness.run("triage", "triage", CI_CONCLUSION="cancelled", MODE="automerge"))
+        self.assertEqual(harness.outputs()["outcome"], "review_held")
+        self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+
+    def test_superseded_cancelled_trigger_keeps_green_safe(self):
+        # A newer run of the same workflow already succeeded at this head;
+        # this cancelled trigger is PROVEN superseded, so it must not force
+        # review — the inventory's own bad/allgreen already reflects reality.
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            run=RUN | {"workflowDatabaseId": 1, "number": 1, "conclusion": "cancelled"},
+            runs={"workflow_runs": [{"workflow_id": 1, "run_number": 2, "conclusion": "success"}]},
+        )
+        self.success(harness.run("triage", "triage", CI_CONCLUSION="cancelled", MODE="automerge"))
+        outputs = harness.outputs()
+        self.assertEqual(outputs["tier"], "safe")
+        self.assertEqual(outputs["outcome"], "green_safe")
+        self.assertTrue(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+
+    def test_triage_fails_closed_to_review_when_trigger_currency_is_indeterminate(self):
+        # No inventory entry for the trigger's own workflow_id: currency is
+        # unprovable either way. Fails closed TOWARD forcing review, never
+        # toward a silent promotion to green off inconclusive data.
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            run=RUN | {"workflowDatabaseId": 1, "number": 1, "conclusion": "cancelled"},
+            runs={"workflow_runs": [{"workflow_id": 2, "run_number": 1, "conclusion": "success"}]},
+        )
+        self.success(harness.run("triage", "triage", CI_CONCLUSION="cancelled", MODE="automerge"))
+        self.assertEqual(harness.outputs()["outcome"], "review_held")
+        self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+
     def test_non_success_sibling_reconciles_to_review_held_instead_of_stranding_the_hold(self):
         # A prior event would have held this as ci_unresolved awaiting the
         # sibling; once the sibling's own non-repair terminal conclusion is
@@ -462,57 +502,6 @@ class WorkflowTests(unittest.TestCase):
         )
         self.success(harness.run("triage", "triage"))
         self.assertEqual(harness.outputs()["outcome"], "ci_unresolved")
-
-    def test_failure_like_sibling_within_grace_window_still_defers(self):
-        # Same mechanism as above, made explicit: a sibling failure that
-        # completed 5 minutes ago is well inside the grace window, so its
-        # own repair attempt is still plausibly in flight — this preserves
-        # repair-before-review ordering.
-        harness = self.harness(
-            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
-            runs={"workflow_runs": [
-                {"workflow_id": 1, "run_number": 1, "conclusion": "success"},
-                {"workflow_id": 2, "run_number": 1, "conclusion": "failure",
-                 "updated_at": iso_minutes_ago(5)},
-            ]},
-        )
-        self.success(harness.run("triage", "triage"))
-        producer = harness.outputs()
-        self.assertEqual(producer["outcome"], "ci_unresolved")
-        self.success(self.handoff(
-            harness,
-            TRIAGE_OUTCOME=producer["outcome"],
-            TRIAGE_NUMBER=producer["number"],
-            TRIAGE_TRIGGER_SHA=producer["trigger_sha"],
-        ))
-        self.assertFalse(any("pro-review" in c for c in harness.calls()))
-
-    def test_failure_like_sibling_past_grace_window_reconciles_and_hands_off(self):
-        # If that sibling's own autopilot invocation died before it ever
-        # established ownership (a transient API failure in its handoff
-        # job, a lost runner), its watched completion event already fired
-        # and nothing will retry it. Once its completion is old enough that
-        # a genuine repair attempt is no longer plausible, the deferral must
-        # end so the PR reconciles to a definite owner instead of waiting on
-        # an event that will never arrive.
-        harness = self.harness(
-            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
-            runs={"workflow_runs": [
-                {"workflow_id": 1, "run_number": 1, "conclusion": "success"},
-                {"workflow_id": 2, "run_number": 1, "conclusion": "failure",
-                 "updated_at": iso_minutes_ago(50)},
-            ]},
-        )
-        self.success(harness.run("triage", "triage"))
-        producer = harness.outputs()
-        self.assertEqual(producer["outcome"], "review_held")
-        self.success(self.handoff(
-            harness,
-            TRIAGE_OUTCOME=producer["outcome"],
-            TRIAGE_NUMBER=producer["number"],
-            TRIAGE_TRIGGER_SHA=producer["trigger_sha"],
-        ))
-        self.assert_queued(harness)
 
     def test_forced_termination_with_bound_metadata_falls_back_to_failed_execution(self):
         harness = self.harness()
@@ -678,6 +667,45 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(harness.outputs()["outcome"], "already_repaired")
         self.assertEqual(harness.outputs()["ok"], "0")
         self.assertEqual(self.mutation_calls(harness), [])
+        self.assertFalse(any(c[0] == "codex" for c in harness.calls()))
+
+    def test_superseded_failure_trigger_does_not_repair(self):
+        # A newer run of the same workflow already superseded this failure
+        # at the same head. Repair must not start: no Codex invocation, and
+        # the once-only repair attempt is not consumed.
+        harness = self.harness(
+            run=RUN | {"workflowDatabaseId": 1, "number": 1, "conclusion": "failure"},
+            runs={"workflow_runs": [{"workflow_id": 1, "run_number": 2, "conclusion": "success"}]},
+        )
+        self.success(harness.run("autofix", "pre", CI_CONCLUSION="failure"))
+        self.assertEqual(harness.outputs()["outcome"], "stale_rejected")
+        self.assertEqual(harness.outputs()["ok"], "0")
+        self.assertEqual(self.mutation_calls(harness), [])
+        self.assertFalse(any(c[0] == "codex" for c in harness.calls()))
+
+    def test_current_failure_trigger_still_repairs(self):
+        # Trigger matches the inventory's max run_number for its workflow_id
+        # (current, not superseded): admission must still succeed exactly
+        # as before currency checking existed.
+        harness = self.harness(
+            run=RUN | {"workflowDatabaseId": 1, "number": 3, "conclusion": "failure"},
+            runs={"workflow_runs": [{"workflow_id": 1, "run_number": 3, "conclusion": "failure"}]},
+        )
+        self.success(harness.run("autofix", "pre", CI_CONCLUSION="failure"))
+        self.assertEqual(harness.outputs()["outcome"], "admitted")
+        self.assertEqual(harness.outputs()["ok"], "1")
+
+    def test_autofix_fails_closed_to_no_repair_when_trigger_currency_is_indeterminate(self):
+        # No inventory entry for the trigger's own workflow_id: currency is
+        # unprovable either way. Fails closed TOWARD NOT repairing — the
+        # exact P1 this guards against.
+        harness = self.harness(
+            run=RUN | {"workflowDatabaseId": 1, "number": 1, "conclusion": "failure"},
+            runs={"workflow_runs": [{"workflow_id": 2, "run_number": 1, "conclusion": "success"}]},
+        )
+        self.success(harness.run("autofix", "pre", CI_CONCLUSION="failure"))
+        self.assertEqual(harness.outputs()["outcome"], "stale_rejected")
+        self.assertEqual(harness.outputs()["ok"], "0")
         self.assertFalse(any(c[0] == "codex" for c in harness.calls()))
 
     def test_two_consecutive_red_completions_produce_exactly_one_repair_then_a_review_owner(self):

@@ -35,11 +35,9 @@ Dependabot / Renovate PR -> CI completes
     a run for this head is still genuinely pending (no conclusion yet), or a
       sibling's own conclusion is itself in the repair set (its own event
       still owes a repair attempt) -> keep the conservative hold; defer
-      handoff so review does not race that repair. A repair-set sibling is
-      only owed within a bounded grace window of ITS OWN completion time
-      (45 minutes); past that window with no ownership established, it
-      stops counting as owed so the PR still reaches a definite owner
-      instead of waiting on a retry that will never come
+      handoff so review does not race that repair, for as long as that
+      conclusion stays in the repair set — no time bound (see Known
+      boundary below for the caller-side sweep this still needs)
     all accepted + at least one success + safe -> existing ready queue (or
       merge when caller selects automerge)
     all accepted + held, OR a fully terminal inventory with zero genuine
@@ -122,25 +120,38 @@ expected, not evidence of a dependency-workflow outage.
   never arrive. This holds even for a fully terminal inventory with zero
   genuine successes (e.g. skipped/neutral/cancelled/stale only) — it reconciles
   to `review_held`, not an eternal `ci_unresolved`.
-  - **Bounded deferral, not an eternal one:** a repair-set sibling only owes
-    its repair attempt within a 45-minute grace window of that sibling's OWN
-    completion (`updated_at` on its run — comfortably above autofix's
-    30-minute plus handoff's 8-minute job timeouts, with headroom for runner
-    queueing delay). Inside the window, the hold is unchanged. Past it, with
-    ownership still not established, that run stops counting as owed and
-    reconciliation proceeds to `review_held` — this covers the case where the
-    sibling's own autopilot invocation died before it ever labeled the PR (a
-    transient API failure in its handoff job, a lost runner), which would
-    otherwise strand the PR forever on a completion event that already fired
-    and will not repeat.
-  - **Known boundary:** the grace window is only checked when a LATER watched
-    completion event arrives and re-runs this reconciliation. If the failed
-    sibling's own completion is the last event that will ever fire for a
-    given head, nothing inside this workflow triggers again to notice the
-    window has passed, and the PR stays held. Closing that residual gap
-    needs a caller-side scheduled sweep (e.g. a periodic workflow that lists
-    PRs still carrying `autopilot:review` without `pro-review` and re-invokes
-    reconciliation for any past the grace window) — not implemented here.
+  - **Known boundary:** `still_owed` has no time bound — a repair-set sibling
+    is owed for as long as it stays in the repair set, full stop. A bounded
+    (time-based) version of this was tried and reverted: it cannot tell "the
+    producer died" from "the producer's callback is merely queued behind
+    this event" in the same FIFO concurrency group, and guessing wrong
+    breaks repair-before-review ordering by dropping a still-pending repair
+    and racing it into review. Two cases stay permanently outside what this
+    workflow alone can close, and both need the same caller-side scheduled
+    sweep — not implemented here:
+    1. A failed sibling's completion is the *last* watched event that will
+       ever fire for a given head. This workflow only reconciles when a
+       watched completion event arrives; if the repair-set sibling's own
+       completion never triggers a further invocation (no other watched
+       workflow runs again at that head), nothing inside this workflow
+       re-checks, and the PR stays `ci_unresolved` indefinitely.
+    2. A producer invocation dies before establishing ownership — e.g.
+       autofix's own job is killed mid-run (lost runner, host outage) after
+       Codex starts but before it labels the PR or hands off, or triage's
+       job dies before applying `pro-review`/`autopilot:review`. No label
+       was ever written, so there is no visible owner, and no further
+       completion event exists to retrigger reconciliation for that head.
+
+    Closing both needs a caller-side scheduled sweep: a periodic workflow
+    that lists open dependency-bot PRs carrying `autopilot:review` (or no
+    autopilot label at all) without `pro-review`/`skip-pro-review`/`claimed`/
+    `loop-run`, checks each one's *actual current* CI state directly via the
+    Checks/Runs API rather than waiting on another `workflow_run` event, and
+    re-invokes reconciliation (or opens review directly) for any that are
+    stuck. This workflow does not reimplement that sweep — it fails closed
+    by holding the PR under conservative review, not by inventing its own
+    deadline for a completion that already fired or a producer that never
+    got the chance to.
 - **Review held:** only an all-green risk hold is eligible for the existing
   `pro-review` intake after fresh checks. A triggering conclusion is success
   evidence only when it is literally `success`, `skipped`, or `neutral` — a
