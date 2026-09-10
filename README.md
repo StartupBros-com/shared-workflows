@@ -218,11 +218,38 @@ expected, not evidence of a dependency-workflow outage.
   either way, repair is refused (Codex never runs) but the unchanged PR still
   reaches the terminal handoff, rather than being silently dropped the way a
   proven-stale target is.
+- **Stale invocation (a strictly newer run exists):** a run-list entry with a
+  strictly greater run_number for the same workflow proves only that THIS
+  invocation is stale — it does not validate that newer run's own inventory
+  entry (which may itself still be mid-flight: an earlier attempt succeeded,
+  a later attempt is failing or pending, and the list has not caught up). A
+  stale invocation stops immediately as `stale_rejected` in both producers:
+  no merge, no repair, no green classification, and it never reaches the
+  terminal handoff (see "Existing owner / stale or rejected target" below).
+  It cannot strand the PR: the newer run is itself a watched workflow, so its
+  own invocation of this reusable workflow either is still queued behind
+  this one in the FIFO `queue: max` concurrency group, or has already run and
+  already established an owner.
 - **Existing owner / stale or rejected target:** no handoff. Drafts, human
   assignees, pending User or Team review requests, and `pro-review`,
   `skip-pro-review`, `claimed`, or `loop-run` labels prevent a second writer from
   being admitted. A changed head is not silently substituted for the head the
   producer handled.
+- **Fork-branch collision (same-repository filtering):** `gh pr list --head
+  "$BRANCH"` matches by branch name only — it cannot be scoped to
+  `<owner>:<branch>` — so on a public caller repo, an untrusted fork PR
+  opened from a branch matching a predictable dependency-bot name (e.g. a
+  Dependabot/Renovate branch) can otherwise appear alongside the legitimate
+  same-repository PR and, via a naive uniqueness check, be used to block
+  triage, repair, and handoff for the real PR. Every `gh pr list --head`
+  lookup site (triage, autofix, handoff) filters candidates to
+  `isCrossRepository == false` **before** enforcing uniqueness or any
+  identity/bot-trust check; this narrows the candidate set and does not
+  weaken any existing guard, including the later per-candidate
+  `isCrossRepository` check kept as defense in depth. The three copies are
+  kept byte-identical by a marker-comment lockstep guard (matching the
+  existing trigger-currency predicate guard), enforced by
+  `tests/test_dependency_autopilot.py`.
 
 A newly requested handoff records the source CI, producer outcome, and expected
 head in one SHA-keyed PR comment, then applies `pro-review`. Only a marker authored

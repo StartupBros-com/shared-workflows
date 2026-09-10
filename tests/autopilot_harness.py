@@ -54,6 +54,38 @@ def freshness_predicate_blocks():
     return triage_blocks[0], autofix_blocks[0]
 
 
+# `gh pr list --head` matches by branch name only — gh 2.97.0 does not
+# support "<owner>:<branch>" qualification — so on a public caller repo a
+# same-named fork branch can collide with a trusted dependency-bot branch.
+# All three PR-lookup sites (triage's "triage" step, autofix's "pre" step,
+# handoff's "handoff" step) filter to same-repository candidates BEFORE
+# enforcing uniqueness, wrapped in a matching
+# `# autopilot-same-repo-filter:begin/:end` marker pair so the three copies
+# can be extracted verbatim and compared for byte-equality, the same
+# pattern as FRESHNESS_PREDICATE_PATTERN above.
+SAME_REPO_FILTER_PATTERN = re.compile(
+    r"# autopilot-same-repo-filter:begin\n(.*?)"
+    r"# autopilot-same-repo-filter:end\n",
+    re.S,
+)
+
+
+def same_repo_filter_blocks():
+    """Extract the triage, autofix, and handoff copies of the shared
+    same-repository PR filter. Each call site's `run:` script must contain
+    the marker pair exactly once; a missing or duplicated marker fails
+    loudly here rather than silently comparing the wrong (or no) text."""
+    triage_script = step("triage", "triage")["run"]
+    autofix_script = step("autofix", "pre")["run"]
+    handoff_script = step("handoff", "handoff")["run"]
+    blocks = {}
+    for name, script in (("triage", triage_script), ("autofix", autofix_script), ("handoff", handoff_script)):
+        found = SAME_REPO_FILTER_PATTERN.findall(script)
+        assert len(found) == 1, (name, script)
+        blocks[name] = found[0]
+    return blocks["triage"], blocks["autofix"], blocks["handoff"]
+
+
 def make_shell_harness(testcase, **config):
     harness = ShellHarness({"prs": [trusted_pr()], "run": RUN} | config)
     testcase.addCleanup(harness.temp.cleanup)

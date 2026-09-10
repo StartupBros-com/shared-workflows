@@ -179,6 +179,32 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotEqual(triage_block, drifted_autofix_block)
         self.assertNotEqual(autofix_block, drifted_autofix_block)
 
+    def test_same_repo_filter_is_locked_across_lookup_sites(self):
+        # Round-11 P1 (FINDING B): every `gh pr list --head "$BRANCH"` site
+        # (triage's "triage" step, autofix's "pre" step, handoff's
+        # "handoff" step) must filter to same-repository candidates before
+        # enforcing uniqueness, and identically so. See
+        # autopilot_harness.same_repo_filter_blocks for the extraction.
+        triage_block, autofix_block, handoff_block = autopilot_harness.same_repo_filter_blocks()
+        # Non-trivial: guards against a marker pair wrapping an empty or
+        # near-empty span, which would make the equality assertion vacuous.
+        self.assertIn("isCrossRepository", triage_block)
+        self.assertIn("select", triage_block)
+        self.assertEqual(triage_block, autofix_block)
+        self.assertEqual(triage_block, handoff_block)
+
+    def test_same_repo_filter_lockstep_guard_fails_on_drift(self):
+        # Proves the guard above is discriminating, not vacuously true: a
+        # one-sided edit to any one copy (here, handoff's) must make the
+        # byte-equality assertion fail, exactly as it would on a real
+        # future drift between the three call sites.
+        triage_block, autofix_block, handoff_block = autopilot_harness.same_repo_filter_blocks()
+        drifted_handoff_block = handoff_block.replace(
+            "isCrossRepository == false", "isCrossRepository == true", 1)
+        self.assertNotEqual(triage_block, drifted_handoff_block)
+        self.assertNotEqual(autofix_block, drifted_handoff_block)
+        self.assertNotEqual(handoff_block, drifted_handoff_block)
+
     def test_success_skipped_and_neutral_share_the_reconciliation_path(self):
         cases = (
             ("skipped", "chore(deps): bump pkg from 1.0.0 to 1.0.1", "green_safe"),
@@ -462,10 +488,24 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(harness.outputs()["outcome"], "review_held")
         self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
 
-    def test_superseded_cancelled_trigger_keeps_green_safe(self):
-        # A newer run of the same workflow already succeeded at this head;
-        # this cancelled trigger is PROVEN superseded, so it must not force
-        # review — the inventory's own bad/allgreen already reflects reality.
+    def test_stale_invocation_with_a_newer_run_number_never_merges_or_classifies_green(self):
+        # Round-11 P1 (FINDING A): a newer run of the same workflow already
+        # succeeded at this head, so this cancelled, older-numbered trigger
+        # is PROVEN stale (l_num > t_num) — but that newer run's OWN
+        # inventory entry (run_number 2, "success") is never independently
+        # re-read or attempt/conclusion-bound the way this run's own
+        # t_num/t_attempt/t_concl are. Concretely: run #2 attempt 1 could
+        # have succeeded while attempt 2 is now failing or still pending,
+        # and this same inventory read would still show attempt 1's stale
+        # success — the exact currency gap this check exists to close, just
+        # moved one hop over onto an unvalidated run. Trusting it here for
+        # allgreen/tier/merge would reopen the same P1 an older cancelled
+        # trigger was already meant to be blocked from causing. The correct
+        # outcome is for THIS invocation to stop entirely — no merge, no
+        # repair, no green/review classification — and defer wholly to run
+        # #2's own invocation of this same reusable workflow, which is
+        # either still queued behind this one in the shared FIFO
+        # concurrency group or has already run to a definite outcome.
         harness = self.harness(
             prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
             run=RUN | {"workflowDatabaseId": 1, "number": 1, "conclusion": "cancelled"},
@@ -473,9 +513,18 @@ class WorkflowTests(unittest.TestCase):
         )
         self.success(harness.run("triage", "triage", CI_CONCLUSION="cancelled", MODE="automerge"))
         outputs = harness.outputs()
-        self.assertEqual(outputs["tier"], "safe")
-        self.assertEqual(outputs["outcome"], "green_safe")
-        self.assertTrue(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+        self.assertEqual(outputs["outcome"], "stale_rejected")
+        self.assertNotIn("tier", outputs)
+        self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+        self.assertEqual(self.mutation_calls(harness), [])
+        # The handoff job already treats a producer's `stale_rejected` as a
+        # clean skip in both routes (repair-set and reconcile-set), so a
+        # stale invocation reaching the terminal job neither strands the PR
+        # nor double-hands-off: see
+        # test_triage_stale_rejected_outcome_skips_handoff_without_mutation
+        # (this route) and
+        # test_stale_or_owned_autofix_outcomes_skip_handoff_without_mutation
+        # (the repair-set route).
 
     def test_triage_lagging_or_missing_inventory_never_proves_green(self):
         # Merge-safety regression: cancelled #11 with a lagging/missing list
@@ -739,6 +788,23 @@ class WorkflowTests(unittest.TestCase):
                 self.success(self.red_handoff(harness, outcome))
                 self.assertEqual(self.mutation_calls(harness), [])
                 self.assertNotIn("Handoff: queued", harness.summary.read_text())
+
+    def test_triage_stale_rejected_outcome_skips_handoff_without_mutation(self):
+        # The reconcile-set counterpart of the case above: a stale
+        # invocation (Round-11 P1) now reports `stale_rejected` from
+        # triage, not just from autofix. The handoff's reconcile-route case
+        # switch already names `stale_rejected` ("triage rejected a stale
+        # or ineligible target") as a clean skip, same as the repair-route
+        # case tested above — this proves that route too, so a stale
+        # invocation can never strand or double-handle the PR regardless of
+        # which producer reported it.
+        harness = self.harness()
+        self.success(self.handoff(
+            harness, CI_CONCLUSION="cancelled",
+            TRIAGE_OUTCOME="stale_rejected", TRIAGE_NUMBER="21", TRIAGE_TRIGGER_SHA=OLD_SHA,
+        ))
+        self.assertEqual(self.mutation_calls(harness), [])
+        self.assertNotIn("Handoff: queued", harness.summary.read_text())
 
     def test_second_terminal_refresh_catches_a_change_after_the_audit_comment(self):
         harness = self.harness(views=[trusted_pr(), trusted_pr(headRefOid=NEW_SHA)])
@@ -1024,6 +1090,52 @@ class WorkflowTests(unittest.TestCase):
                     self.success(harness.run(job, step_id))
                     self.assertIn(harness.outputs()["outcome"], ("stale_rejected", "existing_owner"))
                     self.assertEqual(self.mutation_calls(harness), [])
+
+    def test_fork_pr_collision_does_not_block_legitimate_pr(self):
+        # Round-11 P1 (FINDING B): `gh pr list --head "$BRANCH"` matches by
+        # branch name only, so an untrusted fork PR opened against a
+        # predictable dependency-bot branch name can collide with the
+        # legitimate same-repo PR. The same-repo filter (see
+        # autopilot_harness.same_repo_filter_blocks) must drop the fork
+        # candidate BEFORE uniqueness is enforced, so the legitimate PR is
+        # still found and processed normally — at EVERY lookup site.
+        fork_pr = trusted_pr(
+            number=99, isCrossRepository=True,
+            author={"login": "attacker", "is_bot": False},
+        )
+        for job, step_id in (("triage", "triage"), ("autofix", "pre")):
+            with self.subTest(job=job):
+                harness = self.harness(prs=[trusted_pr(), fork_pr])
+                self.success(harness.run(job, step_id))
+                outputs = harness.outputs()
+                self.assertNotEqual(outputs["outcome"], "stale_rejected", outputs)
+                self.assertEqual(outputs["number"], "21")
+
+        # handoff's own final-refresh lookup: the legitimate PR (#21) is
+        # still found and queued even with the fork PR (#99) also present.
+        harness = self.harness(
+            prs=[trusted_pr(), fork_pr],
+            views=[trusted_pr()],
+        )
+        self.success(self.handoff(harness))
+        self.assert_queued(harness)
+
+    def test_cross_repository_only_target_is_still_rejected_by_the_new_filter(self):
+        # The fork filter narrows the candidate set; it must never become a
+        # way to ADMIT a cross-repository PR just because it is the only
+        # candidate returned by the branch-name match.
+        xrepo_pr = trusted_pr(isCrossRepository=True, author={"login": "attacker", "is_bot": False})
+        for job, step_id in (("triage", "triage"), ("autofix", "pre")):
+            with self.subTest(job=job):
+                harness = self.harness(prs=[xrepo_pr])
+                self.success(harness.run(job, step_id))
+                self.assertEqual(harness.outputs()["outcome"], "stale_rejected")
+                self.assertEqual(self.mutation_calls(harness), [])
+
+        harness = self.harness(prs=[xrepo_pr])
+        self.success(self.handoff(harness))
+        self.assertEqual(self.mutation_calls(harness), [])
+        self.assertNotIn("Handoff: queued", harness.summary.read_text())
 
     def test_producers_fail_closed_on_unavailable_provenance(self):
         for job, step_id in (("autofix", "pre"), ("triage", "triage")):
