@@ -120,6 +120,66 @@ def fork_provenance_gate_blocks():
     return blocks["triage"], blocks["autofix"], blocks["handoff"]
 
 
+# Round-14: a red no-change/no-push outcome (no_changes and its siblings,
+# plus failed_execution) used to be immediately reviewable at handoff, even
+# while a sibling workflow's own failure on the same head was still queued
+# behind this invocation for its own repair turn — the same reconciliation
+# triage already performs for every other red-adjacent path. Both call
+# sites (triage's "triage" step, handoff's "handoff" step) share the live
+# per-sibling revalidation loop, wrapped in a matching
+# `# autopilot-sibling-verification:begin/:end` marker pair, the same
+# byte-equality pattern as FRESHNESS_PREDICATE_PATTERN above.
+SIBLING_VERIFICATION_PATTERN = re.compile(
+    r"# autopilot-sibling-verification:begin\n(.*?)"
+    r"# autopilot-sibling-verification:end\n",
+    re.S,
+)
+
+
+def sibling_verification_blocks():
+    """Extract the triage and handoff copies of the shared sibling live
+    revalidation loop. Each call site's `run:` script must contain the
+    marker pair exactly once; a missing or duplicated marker fails loudly
+    here rather than silently comparing the wrong (or no) text."""
+    triage_script = step("triage", "triage")["run"]
+    handoff_script = step("handoff", "handoff")["run"]
+    blocks = {}
+    for name, script in (("triage", triage_script), ("handoff", handoff_script)):
+        found = SIBLING_VERIFICATION_PATTERN.findall(script)
+        assert len(found) == 1, (name, script)
+        blocks[name] = found[0]
+    return blocks["triage"], blocks["handoff"]
+
+
+# Companion to SIBLING_VERIFICATION_PATTERN: given the verified inventory,
+# both call sites derive `still_owed`/`unresolved` from SIBLING entries only
+# (`workflow_id != $t_wf`) — each site's own trigger workflow is resolved by
+# its own caller (triage's trigger_lagging override; handoff's already-final
+# AUTOFIX_OUTCOME), never by this generic scan. Wrapped in a matching
+# `# autopilot-sibling-still-owed:begin/:end` marker pair, the same
+# byte-equality pattern as above.
+SIBLING_STILL_OWED_PATTERN = re.compile(
+    r"# autopilot-sibling-still-owed:begin\n(.*?)"
+    r"# autopilot-sibling-still-owed:end\n",
+    re.S,
+)
+
+
+def sibling_still_owed_blocks():
+    """Extract the triage and handoff copies of the shared still-owed
+    computation. Each call site's `run:` script must contain the marker
+    pair exactly once; a missing or duplicated marker fails loudly here
+    rather than silently comparing the wrong (or no) text."""
+    triage_script = step("triage", "triage")["run"]
+    handoff_script = step("handoff", "handoff")["run"]
+    blocks = {}
+    for name, script in (("triage", triage_script), ("handoff", handoff_script)):
+        found = SIBLING_STILL_OWED_PATTERN.findall(script)
+        assert len(found) == 1, (name, script)
+        blocks[name] = found[0]
+    return blocks["triage"], blocks["handoff"]
+
+
 # Round-12 P1: `gh pr list --head` defaults to a 30-item cap with no
 # server-side owner scoping, so an attacker opening more fork PRs than the
 # cap on this predictable branch name can crowd the legitimate same-repo

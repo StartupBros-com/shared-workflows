@@ -269,6 +269,54 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotEqual(autofix_block, drifted_handoff_block)
         self.assertNotEqual(handoff_block, drifted_handoff_block)
 
+    def test_sibling_verification_is_locked_between_triage_and_handoff(self):
+        # Round-14 P1: an unchanged red outcome at handoff (no_changes and
+        # its siblings, plus failed_execution) must run the same live
+        # per-sibling revalidation triage already performs before claiming
+        # ownership — and identically so. See
+        # autopilot_harness.sibling_verification_blocks for the extraction.
+        triage_block, handoff_block = autopilot_harness.sibling_verification_blocks()
+        # Non-trivial: guards against a marker pair wrapping an empty or
+        # near-empty span, which would make the equality assertion vacuous.
+        self.assertIn("sib_live_status", triage_block)
+        self.assertIn("run_attempt", triage_block)
+        self.assertEqual(triage_block, handoff_block)
+
+    def test_sibling_verification_lockstep_guard_fails_on_drift(self):
+        # Proves the guard above is discriminating, not vacuously true: a
+        # one-sided edit to handoff's copy must make the byte-equality
+        # assertion fail, exactly as it would on a real future drift
+        # between the two call sites.
+        triage_block, handoff_block = autopilot_harness.sibling_verification_blocks()
+        drifted_handoff_block = handoff_block.replace(
+            '"$sib_live_status" != "completed"', '"$sib_live_status" == "completed"', 1)
+        self.assertNotEqual(triage_block, drifted_handoff_block)
+        self.assertNotEqual(handoff_block, drifted_handoff_block)
+
+    def test_sibling_still_owed_is_locked_between_triage_and_handoff(self):
+        # Companion to sibling-verification: given the verified inventory,
+        # both call sites must derive still_owed/unresolved from SIBLING
+        # entries only (workflow_id != this invocation's own workflow) —
+        # and identically so. See autopilot_harness.sibling_still_owed_blocks
+        # for the extraction.
+        triage_block, handoff_block = autopilot_harness.sibling_still_owed_blocks()
+        # Non-trivial: guards against a marker pair wrapping an empty or
+        # near-empty span, which would make the equality assertion vacuous.
+        self.assertIn("still_owed", triage_block)
+        self.assertIn("workflow_id != $wf", triage_block)
+        self.assertEqual(triage_block, handoff_block)
+
+    def test_sibling_still_owed_lockstep_guard_fails_on_drift(self):
+        # Proves the guard above is discriminating, not vacuously true: a
+        # one-sided edit to handoff's copy must make the byte-equality
+        # assertion fail, exactly as it would on a real future drift
+        # between the two call sites.
+        triage_block, handoff_block = autopilot_harness.sibling_still_owed_blocks()
+        drifted_handoff_block = handoff_block.replace(
+            'unresolved=0', 'unresolved=1', 1)
+        self.assertNotEqual(triage_block, drifted_handoff_block)
+        self.assertNotEqual(handoff_block, drifted_handoff_block)
+
     def test_success_skipped_and_neutral_share_the_reconciliation_path(self):
         cases = (
             ("skipped", "chore(deps): bump pkg from 1.0.0 to 1.0.1", "green_safe"),
@@ -1495,6 +1543,44 @@ class WorkflowTests(unittest.TestCase):
                 self.assert_queued(harness)
                 self.assertIn(outcome, harness.summary.read_text())
 
+    def test_unchanged_red_outcome_with_all_siblings_settled_still_reaches_an_owner(self):
+        # Do NOT regress the invariant in the opposite direction: once every
+        # other watched workflow at this head has settled (here, workflow 2
+        # concluded success — not pending, not repair-set), an unchanged red
+        # outcome must still reach a definite owner rather than stranding
+        # behind a sibling that no longer owes anything.
+        harness = self.harness(runs={"workflow_runs": [
+            {"workflow_id": 1, "run_number": 1, "conclusion": "failure"},
+            {"workflow_id": 2, "run_number": 4, "conclusion": "success"},
+        ]})
+        self.success(self.red_handoff(harness, "no_changes", AUTOFIX_RESULT="success"))
+        self.assert_queued(harness)
+
+    def test_two_failing_siblings_w1_defers_and_w2_gets_its_repair_turn(self):
+        # Round-14 P1: two watched workflows (W1, W2) both fail on the same
+        # head. W1's callback runs first, produces no_changes, and must
+        # defer — not claim pro-review ownership — while W2 (workflow_id 2,
+        # a distinct watched workflow still in the repair set) has not yet
+        # had its own serialized repair turn.
+        harness = self.harness(
+            run=RUN | {"workflowDatabaseId": 1, "number": 3, "conclusion": "failure"},
+            runs={"workflow_runs": [
+                {"workflow_id": 1, "run_number": 3, "conclusion": "failure"},
+                {"workflow_id": 2, "run_number": 5, "conclusion": "failure"},
+            ]},
+        )
+        self.success(self.red_handoff(harness, "no_changes", AUTOFIX_RESULT="success"))
+        self.assertFalse(any(c[:3] == ["gh", "pr", "edit"] and "pro-review" in c for c in harness.calls()))
+        self.assertIn("Handoff: skipped", harness.summary.read_text())
+        self.assertNotIn("Handoff: queued", harness.summary.read_text())
+        # W2's own subsequent serialized callback: with no owner label
+        # applied by W1, it still reaches admission and gets its repair
+        # turn (Codex would run next).
+        self.success(harness.run("autofix", "pre", CI_CONCLUSION="failure",
+                                  AUTOPILOT_CURRENCY_RETRY_SECONDS="0"))
+        self.assertEqual(harness.outputs()["outcome"], "admitted")
+        self.assertEqual(harness.outputs()["ok"], "1")
+
     def test_failed_execution_cannot_hand_off_without_bound_producer_metadata(self):
         harness = self.harness()
         self.assertNotEqual(self.red_handoff(harness, "failed_execution", AUTOFIX_RESULT="failure",
@@ -1507,6 +1593,18 @@ class WorkflowTests(unittest.TestCase):
         self.success(result)
         self.assertEqual(self.mutation_calls(harness), [])
         self.assertNotIn("Handoff: queued", harness.summary.read_text())
+
+    def test_successful_push_does_not_invoke_the_new_sibling_reconciliation(self):
+        # Round-14 P1 only touches the UNCHANGED red outcomes (no push);
+        # successful_push already skips before any of that new code runs,
+        # and must keep doing so — no run-inventory fetch at all.
+        harness = self.harness(prs=[trusted_pr(headRefOid=NEW_SHA)])
+        result = self.red_handoff(harness, "successful_push", AUTOFIX_PUSHED_SHA=NEW_SHA)
+        self.success(result)
+        self.assertFalse(any(
+            c[:2] == ["gh", "api"] and any("actions/runs?head_sha=" in a for a in c)
+            for c in harness.calls()
+        ))
 
     def test_result_step_distinguishes_execution_and_no_change(self):
         for codex_status, guard_outcome, expected in (

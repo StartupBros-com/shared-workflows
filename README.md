@@ -24,7 +24,12 @@ Dependabot / Renovate PR -> CI completes
       tier=review by the `autopilot:autofixed` label) selects the next owner
     no changes / unavailable credentials / failed execution / already-repaired /
       currency-indeterminate -> hand off the unchanged PR only if its identity
-      and source CI can be revalidated
+      and source CI can be revalidated, AND only once the same live sibling
+      reconciliation used below (a sibling still pending, or still owed its
+      own repair-set completion's repair attempt) has cleared for this head —
+      otherwise defer, the same way the reconcile route does, so a queued
+      sibling failure still gets its own repair turn instead of losing it to
+      this unchanged outcome's ownership claim
   RECONCILE (everything not in the repair set — success, skipped, neutral,
       cancelled, stale, or any future conclusion) -> reconcile the latest
       watched-workflow inventory. Only a triggering conclusion that is
