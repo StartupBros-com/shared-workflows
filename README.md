@@ -21,9 +21,12 @@ Dependabot / Renovate PR -> CI completes
 ```
 
 The workflow serializes all producer and handoff jobs for a caller's PR branch.
-The handoff waits for both producer jobs to finish; labeling at red-path admission
-would race the repair worker. It covers held green PRs as well as unresolved red
-PRs without adding another reviewer or enrolling each repository in a new queue.
+Its workflow-level `queue: max` retains up to 100 pending runs and starts them FIFO
+by when they enter the queue, instead of allowing a late stale event to replace a
+pending current-head run. The handoff waits for both producer jobs to finish;
+labeling at red-path admission would race the repair worker. It covers held green
+PRs as well as unresolved red PRs without adding another reviewer or enrolling
+each repository in a new queue.
 
 ### Existing callers
 
@@ -87,9 +90,10 @@ expected, not evidence of a dependency-workflow outage.
   job itself reports `failure` and had already bound a PR number and trigger
   SHA before it died; a `cancelled` job or missing binding still fails closed.
 - **Existing owner / stale or rejected target:** no handoff. Drafts, human
-  assignees, and `pro-review`, `skip-pro-review`, `claimed`, or `loop-run` labels
-  prevent a second writer from being admitted. A changed head is not silently
-  substituted for the head the producer handled.
+  assignees, pending User or Team review requests, and `pro-review`,
+  `skip-pro-review`, `claimed`, or `loop-run` labels prevent a second writer from
+  being admitted. A changed head is not silently substituted for the head the
+  producer handled.
 
 A newly requested handoff records the source CI, producer outcome, and expected
 head in one SHA-keyed PR comment, then applies `pro-review`. Repeated events do not
@@ -114,7 +118,17 @@ visible to this producer.
 ```bash
 bash tests/classify-tier.test.sh
 python3 -m unittest discover -s tests -p 'test_*.py' -v
+mise exec actionlint@1.7.12 -- actionlint \
+  -ignore '^unexpected key "queue" for "concurrency" section\. expected one of "cancel-in-progress", "group"$' \
+  .github/workflows/*.yml
 ```
+
+Actionlint v1.7.12, and upstream at `011a6d15e749bb3f2d771eed9c7aa0e7e3e10ee7`,
+still reject GitHub's documented workflow-level `queue` property. The anchored ignore
+suppresses only that exact unsupported-property message; all other lint findings
+remain active. Remove the ignore when actionlint supports `concurrency.queue`. The
+executable graph test independently pins `queue: max`, `cancel-in-progress: false`,
+and the absence of per-job concurrency.
 
 The Python tests use PyYAML (also used by CI's YAML parse check). They execute the
 actual workflow shell blocks, with GitHub, Git, and Codex replaced only at the

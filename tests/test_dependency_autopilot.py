@@ -40,6 +40,7 @@ def trusted_pr(**changes):
         "title": "chore(deps): bump pkg from 1.0.0 to 2.0.0",
         "labels": [],
         "assignees": [],
+        "reviewRequests": [],
     }
     pr.update(changes)
     return pr
@@ -355,6 +356,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("Handoff: queued", harness.summary.read_text())
         self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
 
+    def assert_root_concurrency(self, workflow):
+        self.assertIn("github.repository", workflow["concurrency"]["group"])
+        self.assertIn("inputs.pr_branch", workflow["concurrency"]["group"])
+        self.assertEqual(workflow["concurrency"]["queue"], "max")
+        self.assertFalse(workflow["concurrency"]["cancel-in-progress"])
+        for job_name, candidate in workflow["jobs"].items():
+            self.assertNotIn("concurrency", candidate, job_name)
+
     def test_graph_serializes_producers_then_handoff(self):
         job = WORKFLOW["jobs"]["handoff"]
         self.assertEqual(set(job["needs"]), {"triage", "autofix"})
@@ -364,10 +373,26 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(job["permissions"], {
             "contents": "read", "pull-requests": "write", "actions": "read",
         })
-        self.assertIn("github.repository", WORKFLOW["concurrency"]["group"])
-        self.assertIn("inputs.pr_branch", WORKFLOW["concurrency"]["group"])
-        self.assertFalse(WORKFLOW["concurrency"]["cancel-in-progress"])
-        self.assertNotIn("concurrency", WORKFLOW["jobs"]["autofix"])
+        self.assert_root_concurrency(WORKFLOW)
+
+    def test_graph_rejects_an_invalid_queue_value(self):
+        invalid = WORKFLOW | {
+            "concurrency": WORKFLOW["concurrency"] | {"queue": "latest"},
+        }
+        with self.assertRaises(AssertionError):
+            self.assert_root_concurrency(invalid)
+
+    def test_all_pr_metadata_requests_include_review_requests(self):
+        requests = []
+        for job in WORKFLOW["jobs"].values():
+            for item in job["steps"]:
+                script = item.get("run", "").replace("\\\n", " ")
+                requests.extend(re.findall(
+                    r"gh pr (?:list|view)\b[^\n]*?--json ([^>\n]+)", script,
+                ))
+        self.assertEqual(len(requests), 7, requests)
+        for fields in requests:
+            self.assertIn("reviewRequests", fields.split(","), fields)
 
     def test_metadata_only_jobs_have_bounded_timeouts(self):
         # Triage and handoff do no long-running work; a platform default
@@ -669,6 +694,56 @@ class WorkflowTests(unittest.TestCase):
                 harness = self.harness(prs=[trusted_pr(author={"login": login, "is_bot": True})])
                 self.success(harness.run("autofix", "pre"))
                 self.assertEqual(harness.outputs()["ok"], "1")
+
+    def test_pending_user_or_team_review_blocks_both_producers(self):
+        requests = (
+            [{"__typename": "User", "login": "operator"}],
+            [{"__typename": "Team", "name": "Maintainers", "slug": "maintainers"}],
+        )
+        for job, step_id in (("autofix", "pre"), ("triage", "triage")):
+            for review_requests in requests:
+                with self.subTest(job=job, review_requests=review_requests):
+                    harness = self.harness(prs=[trusted_pr(reviewRequests=review_requests)])
+                    self.success(harness.run(job, step_id))
+                    self.assertEqual(harness.outputs()["outcome"], "existing_owner")
+                    self.assertEqual(self.mutation_calls(harness), [])
+
+    def test_pending_user_or_team_review_blocks_pre_push_flag(self):
+        requests = (
+            [{"__typename": "User", "login": "operator"}],
+            [{"__typename": "Team", "name": "Maintainers", "slug": "maintainers"}],
+        )
+        for review_requests in requests:
+            with self.subTest(review_requests=review_requests):
+                harness = self.harness(views=[trusted_pr(reviewRequests=review_requests)])
+                self.success(harness.run("autofix", "flag", NUM="21", TRIGGER_SHA=OLD_SHA))
+                self.assertEqual(harness.outputs()["outcome"], "existing_owner")
+                self.assertNotIn("flagged", harness.outputs())
+                self.assertEqual(self.mutation_calls(harness), [])
+
+    def test_pending_user_or_team_review_blocks_terminal_refreshes(self):
+        requests = (
+            [{"__typename": "User", "login": "operator"}],
+            [{"__typename": "Team", "name": "Maintainers", "slug": "maintainers"}],
+        )
+        for review_requests in requests:
+            with self.subTest(review_requests=review_requests, refresh="first"):
+                harness = self.harness(views=[trusted_pr(reviewRequests=review_requests)])
+                self.success(self.handoff(harness))
+                self.assertEqual(self.mutation_calls(harness), [])
+                self.assertNotIn("Handoff: queued", harness.summary.read_text())
+            with self.subTest(review_requests=review_requests, refresh="final"):
+                harness = self.harness(views=[
+                    trusted_pr(),
+                    trusted_pr(reviewRequests=review_requests),
+                ])
+                self.success(self.handoff(harness))
+                self.assertTrue(any(c[:3] == ["gh", "pr", "comment"] for c in harness.calls()))
+                self.assertFalse(any(
+                    c[:3] == ["gh", "pr", "edit"] and "pro-review" in c
+                    for c in harness.calls()
+                ))
+                self.assertNotIn("Handoff: queued", harness.summary.read_text())
 
     def test_both_producers_reject_untrusted_and_owned_targets(self):
         cases = [
