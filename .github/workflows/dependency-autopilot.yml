@@ -199,8 +199,13 @@ jobs:
             outcome="green_safe"
           else
             gh pr edit "$num" --repo "$GITHUB_REPOSITORY" --add-label "autopilot:review" --remove-label "autopilot:ready"
-            echo "::notice::#$num is held for review ($reason)."
-            outcome="review_held"
+            if [ "$allgreen" = "1" ]; then
+              echo "::notice::#$num is held for review ($reason)."
+              outcome="review_held"
+            else
+              echo "::notice::#$num remains held while sibling CI is unresolved ($reason)."
+              outcome="ci_unresolved"
+            fi
           fi
           { echo "tier=$tier"; echo "outcome=$outcome"; } >> "$GITHUB_OUTPUT"
 
@@ -574,6 +579,7 @@ jobs:
             case "$producer_outcome" in
               green_safe) skip "safe green PRs stay in the inexpensive ready queue" ;;
               review_held) : ;;
+              ci_unresolved) skip "sibling CI is unresolved; defer to its watched completion event" ;;
               existing_owner) skip "an existing review or active owner already controls this PR" ;;
               stale_rejected) skip "triage rejected a stale or ineligible target" ;;
               *) fail "triage returned missing or failed outcome metadata" ;;
@@ -689,7 +695,12 @@ jobs:
 
           marker="<!-- dependency-autopilot-handoff:$expected_sha -->"
           gh api "repos/$GITHUB_REPOSITORY/issues/$num/comments?per_page=100" --paginate --slurp > "$comments_file"
-          if ! jq -e --arg marker "$marker" 'any(.[][]?; (.body // "") | contains($marker))' "$comments_file" >/dev/null; then
+          if ! jq -e --arg marker "$marker" '
+                any(.[][]?;
+                  .user.type == "Bot" and
+                  .user.login == "github-actions[bot]" and
+                  ((.body // "") | contains($marker)))
+              ' "$comments_file" >/dev/null; then
             body=$(printf '%s\n%s\n%s\n%s\n%s' \
               "$marker" \
               "Requesting review for PR #$num at \`$expected_sha\`." \

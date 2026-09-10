@@ -9,8 +9,9 @@ A shared dependency workflow, called after a repository's PR CI finishes:
 ```text
 Dependabot / Renovate PR -> CI completes
   green -> classify
-    safe -> existing ready queue (or merge when caller selects automerge)
-    held -> existing pro-review daemon
+    sibling CI unresolved -> keep the conservative hold; defer handoff
+    all green + safe -> existing ready queue (or merge when caller selects automerge)
+    all green + held -> existing pro-review daemon
   red (failure, timed_out, action_required, startup_failure) -> bounded
       application-code repair
     pushed -> hold for review, rerun CI, hand off the new head
@@ -35,13 +36,17 @@ inputs are unchanged. `mode` defaults to **queue**, not automerge. Existing call
 pinned to an older shared-workflows commit do **not** acquire this behavior until
 that pin is deliberately updated to a reviewed commit.
 
-A caller filters to dependency-bot PR events and passes the original CI run:
+A caller filters to dependency-bot PR events and passes the original CI run.
+Its `workflows:` list **must name every PR-triggered CI workflow**, not only the
+primary workflow: unresolved sibling CI is deliberately deferred until that
+sibling's watched completion event arrives, so an incomplete list cannot promise
+a failure callback or safe repair-before-review ordering.
 
 ```yaml
 name: Dependency Autopilot
 on:
   workflow_run:
-    workflows: ["CI"] # use the repository's actual PR CI workflow name
+    workflows: ["CI", "Other PR checks"] # list EVERY PR-triggered CI workflow name
     types: [completed]
 permissions:
   contents: write
@@ -74,7 +79,12 @@ expected, not evidence of a dependency-workflow outage.
 - **Safe green:** retains the existing `autopilot:ready` queue. It does not gain an
   expensive Pro review merely because this integration exists. `mode: automerge`
   retains the existing merge path, bound to the classified head SHA.
-- **Review held:** eligible for the existing `pro-review` intake after fresh checks.
+- **CI unresolved:** retains the conservative `autopilot:review` hold but does not
+  request Pro review. Handoff waits for a watched missing, pending, or failed
+  sibling workflow to complete; this requires the caller's `workflows:` list to
+  include every PR-triggered CI workflow.
+- **Review held:** only an all-green risk hold is eligible for the existing
+  `pro-review` intake after fresh checks.
 - **Successful push:** preserves `autopilot:autofixed`. The hold is applied before
   publishing AI changes so a label-write failure cannot leave them eligible for
   automerge. If a push fails, the conservative review hold remains.
@@ -96,9 +106,11 @@ expected, not evidence of a dependency-workflow outage.
   producer handled.
 
 A newly requested handoff records the source CI, producer outcome, and expected
-head in one SHA-keyed PR comment, then applies `pro-review`. Repeated events do not
-repeat the handoff. Existing label metadata is not overwritten. API failures are
-visible as failed jobs, not reported as successful queue events.
+head in one SHA-keyed PR comment, then applies `pro-review`. Only a marker authored
+by `github-actions[bot]` with REST user type `Bot` is authoritative; human and
+other-bot lookalikes do not suppress the workflow-owned comment. Repeated events
+do not repeat the handoff. Existing label metadata is not overwritten. API
+failures are visible as failed jobs, not reported as successful queue events.
 
 The **existing pro-review daemon** owns the next review/repair action. It consumes
 `pro-review`, binds decisions to a PR/head, and may repair confirmed findings. It

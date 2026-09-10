@@ -135,7 +135,10 @@ if name == "gh":
                     state[opposite].remove(label)
         save()
     elif args[:2] == ["pr", "comment"]:
-        state["comments"].append({"body": args[args.index("--body") + 1]})
+        state["comments"].append({
+            "body": args[args.index("--body") + 1],
+            "user": {"type": "Bot", "login": "github-actions[bot]"},
+        })
         save()
     elif args[:2] != ["pr", "merge"]:
         sys.exit(47)
@@ -447,7 +450,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(harness.outputs()["outcome"], "review_held")
         self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
 
-    def test_non_green_sibling_ci_holds_for_review_even_under_automerge(self):
+    def test_non_green_sibling_ci_is_deferred_even_under_automerge(self):
         for conclusion in ("failure", None):
             with self.subTest(conclusion=conclusion):
                 runs = {"workflow_runs": [
@@ -459,8 +462,37 @@ class WorkflowTests(unittest.TestCase):
                     runs=runs,
                 )
                 self.success(harness.run("triage", "triage", MODE="automerge"))
-                self.assertEqual(harness.outputs()["outcome"], "review_held")
+                producer = harness.outputs()
+                self.assertEqual(producer["outcome"], "ci_unresolved")
+                self.success(self.handoff(
+                    harness,
+                    TRIAGE_OUTCOME=producer["outcome"],
+                    TRIAGE_NUMBER=producer["number"],
+                    TRIAGE_TRIGGER_SHA=producer["trigger_sha"],
+                ))
+                self.assertIn("sibling CI is unresolved", harness.summary.read_text())
+                self.assertFalse(any("pro-review" in c for c in harness.calls()))
                 self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+
+    def test_success_then_unresolved_does_not_block_same_head_failure_autofix(self):
+        harness = self.harness(runs={"workflow_runs": [
+            {"workflow_id": 1, "run_number": 1, "conclusion": "success"},
+            {"workflow_id": 2, "run_number": 1, "conclusion": None},
+        ]})
+        self.success(harness.run("triage", "triage"))
+        producer = harness.outputs()
+        self.assertEqual(producer["outcome"], "ci_unresolved")
+        self.success(self.handoff(
+            harness,
+            TRIAGE_OUTCOME=producer["outcome"],
+            TRIAGE_NUMBER=producer["number"],
+            TRIAGE_TRIGGER_SHA=producer["trigger_sha"],
+        ))
+        self.assertFalse(any("pro-review" in c for c in harness.calls()))
+
+        self.success(harness.run("autofix", "pre"))
+        self.assertEqual(harness.outputs()["outcome"], "admitted")
+        self.assertEqual(harness.outputs()["trigger_sha"], OLD_SHA)
 
     def test_all_green_check_flattens_paginated_run_pages(self):
         harness = self.harness(
@@ -471,7 +503,11 @@ class WorkflowTests(unittest.TestCase):
             ],
         )
         self.success(harness.run("triage", "triage", MODE="automerge"))
-        self.assertEqual(harness.outputs()["outcome"], "review_held")
+        producer = harness.outputs()
+        self.assertEqual(producer["outcome"], "ci_unresolved")
+        self.success(self.handoff(harness, TRIAGE_OUTCOME=producer["outcome"]))
+        self.assertIn("sibling CI is unresolved", harness.summary.read_text())
+        self.assertFalse(any("pro-review" in c for c in harness.calls()))
         self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
 
     def test_empty_run_inventory_is_never_treated_as_all_green(self):
@@ -480,7 +516,11 @@ class WorkflowTests(unittest.TestCase):
             run_pages=[{"workflow_runs": []}],
         )
         self.success(harness.run("triage", "triage", MODE="automerge"))
-        self.assertEqual(harness.outputs()["outcome"], "review_held")
+        producer = harness.outputs()
+        self.assertEqual(producer["outcome"], "ci_unresolved")
+        self.success(self.handoff(harness, TRIAGE_OUTCOME=producer["outcome"]))
+        self.assertIn("sibling CI is unresolved", harness.summary.read_text())
+        self.assertFalse(any("pro-review" in c for c in harness.calls()))
         self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
 
     def test_triage_stops_if_ownership_or_head_changes_before_mutation(self):
@@ -890,11 +930,31 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(sum(c[:3] == ["gh", "pr", "edit"] for c in harness.calls()), 1)
         self.assertEqual(sum(c[:3] == ["gh", "pr", "comment"] for c in harness.calls()), 1)
 
-    def test_existing_comment_on_earlier_page_is_not_duplicated(self):
+    def test_trusted_actions_comment_on_earlier_page_is_not_duplicated(self):
         marker = f"<!-- dependency-autopilot-handoff:{OLD_SHA} -->"
-        harness = self.harness(comment_pages=[[{"body": marker}], [{"body": "unrelated"}]])
+        trusted = {
+            "body": marker,
+            "user": {"type": "Bot", "login": "github-actions[bot]"},
+        }
+        harness = self.harness(comment_pages=[[trusted], [{"body": "unrelated"}]])
         self.success(self.handoff(harness))
         self.assertFalse(any(c[:3] == ["gh", "pr", "comment"] for c in harness.calls()))
+        self.assert_queued(harness)
+
+    def assert_spoofed_marker_is_replaced(self, author):
+        marker = f"<!-- dependency-autopilot-handoff:{OLD_SHA} -->"
+        harness = self.harness(comment_pages=[[{"body": marker, "user": author}]])
+        self.success(self.handoff(harness))
+        comments = [c for c in harness.calls() if c[:3] == ["gh", "pr", "comment"]]
+        self.assertEqual(len(comments), 1, harness.calls())
+        self.assertIn(marker, comments[0][-1])
+        self.assert_queued(harness)
+
+    def test_human_spoofed_marker_does_not_suppress_trusted_audit_comment(self):
+        self.assert_spoofed_marker_is_replaced({"type": "User", "login": "operator"})
+
+    def test_wrong_bot_spoofed_marker_does_not_suppress_trusted_audit_comment(self):
+        self.assert_spoofed_marker_is_replaced({"type": "Bot", "login": "other-app[bot]"})
 
     def test_label_metadata_is_not_force_overwritten(self):
         harness = self.harness()
