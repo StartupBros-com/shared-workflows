@@ -6,17 +6,16 @@ Org-shared **reusable GitHub Actions workflows** for StartupBros-com.
 
 A shared dependency workflow, called after a repository's PR CI finishes:
 
+The space of run conclusions is exhaustively **partitioned into two routes, not
+enumerated as a list of known values**: a tightly-scoped REPAIR set, and
+everything else, which reconciles. GitHub can add new conclusion values at any
+time (`stale` is a real example); because "everything else" is defined as the
+negation of the repair set rather than a second positive list, no value —
+known today or added later — can fall through to a silent no-op.
+
 ```text
 Dependabot / Renovate PR -> CI completes
-  success / skipped / neutral / cancelled -> reconcile the latest watched-workflow
-      inventory (a cancelled trigger is forced to tier=review; it can only reach
-      review_held or ci_unresolved, never green_safe or a merge)
-    no genuine success, or a non-cancelled sibling still unresolved -> keep the
-      conservative hold; defer handoff
-    all accepted + at least one success + safe -> existing ready queue (or merge
-      when caller selects automerge)
-    all accepted + at least one success + held -> existing pro-review daemon
-  red (failure, timed_out, action_required, startup_failure) -> bounded
+  REPAIR (failure, timed_out, action_required, startup_failure) -> bounded
       application-code repair, unless the PR already carries
       `autopilot:autofixed` (one repair attempt only) -> reconciles straight to
       the terminal handoff instead
@@ -26,8 +25,23 @@ Dependabot / Renovate PR -> CI completes
     no changes / unavailable credentials / failed execution / already-repaired ->
       hand off the unchanged PR only if its identity and source CI can be
       revalidated
-  anything else (unknown/other conclusions) -> no handoff path; does not restart
-      work
+  RECONCILE (everything not in the repair set — success, skipped, neutral,
+      cancelled, stale, or any future conclusion) -> reconcile the latest
+      watched-workflow inventory. Only a triggering conclusion that is
+      literally success, skipped, or neutral can ever count as success
+      evidence; every other value in this route (cancelled, stale, unknown)
+      is forced to tier=review and can only reach review_held or
+      ci_unresolved, never green_safe or a merge.
+    a run for this head is still genuinely pending (no conclusion yet), or a
+      sibling's own conclusion is itself in the repair set (its own event
+      still owes a repair attempt) -> keep the conservative hold; defer
+      handoff so review does not race that repair
+    all accepted + at least one success + safe -> existing ready queue (or
+      merge when caller selects automerge)
+    all accepted + held, OR a fully terminal inventory with zero genuine
+      successes (nothing pending, nothing still owed a repair attempt) ->
+      existing pro-review daemon; a terminal but all-bad inventory is never
+      stuck waiting on an event that already happened
 ```
 
 The workflow serializes all producer and handoff jobs for a caller's PR branch.
@@ -47,10 +61,12 @@ that pin is deliberately updated to a reviewed commit.
 
 A caller filters to dependency-bot PR events and passes the original CI run.
 Its `workflows:` list **must name every PR-triggered CI workflow**, not only the
-primary workflow: unresolved sibling CI is deliberately deferred until that
-sibling's watched completion event arrives. Success, skipped, and neutral watched
-completions all run reconciliation; failure-like completions run repair. An
-incomplete list cannot promise a callback or safe repair-before-review ordering.
+primary workflow: a sibling still genuinely pending, or a sibling whose own
+conclusion is in the repair set (it still owes its own repair attempt), is
+deliberately deferred until that sibling's watched completion event arrives.
+Repair-set completions run repair; every other completion — including any
+conclusion not named above — runs reconciliation. An incomplete list cannot
+promise a callback or safe repair-before-review ordering.
 
 ```yaml
 name: Dependency Autopilot
@@ -90,18 +106,26 @@ expected, not evidence of a dependency-workflow outage.
   expensive Pro review merely because this integration exists. `mode: automerge`
   retains the existing merge path, bound to the classified head SHA.
 - **CI unresolved:** retains the conservative `autopilot:review` hold but does not
-  request Pro review. Handoff waits for a watched missing, pending, or failed
-  sibling workflow to complete; this requires the caller's `workflows:` list to
-  include every PR-triggered CI workflow. A `cancelled` sibling is terminal and
-  does not keep the hold waiting forever: once every other watched run is
-  genuinely resolved and at least one is a real success, the reconciliation
+  request Pro review. `unresolved` means a real future event is still owed for
+  this head: a run with no conclusion yet, or a run whose conclusion is itself
+  in the repair set (that workflow's own completion still owes a genuine
+  repair attempt, and handing off to review now would race it). This requires
+  the caller's `workflows:` list to include every PR-triggered CI workflow.
+  Every other terminal conclusion — cancelled, stale, or any future value —
+  owes nothing further and does not keep the hold waiting forever: once
+  nothing is genuinely pending or still owed a repair attempt, reconciliation
   proceeds to `review_held` instead of staying stuck on a completion that will
-  never arrive. `cancelled` itself is never counted as that success.
+  never arrive. This holds even for a fully terminal inventory with zero
+  genuine successes (e.g. skipped/neutral/cancelled/stale only) — it reconciles
+  to `review_held`, not an eternal `ci_unresolved`.
 - **Review held:** only an all-green risk hold is eligible for the existing
-  `pro-review` intake after fresh checks. A `cancelled` triggering conclusion is
-  always forced to this tier (or to `ci_unresolved`) — it is never treated as
-  success evidence and can never reach `green_safe` or a merge, even if the
-  freshly fetched inventory now looks all-green.
+  `pro-review` intake after fresh checks. A triggering conclusion is success
+  evidence only when it is literally `success`, `skipped`, or `neutral` — a
+  closed three-value allowlist, not an open list of "bad" values to catch.
+  Every other conclusion (`cancelled`, `stale`, or any value GitHub adds
+  later) is always forced to this tier (or to `ci_unresolved`) — never
+  treated as success evidence and never able to reach `green_safe` or a
+  merge, even if the freshly fetched inventory now looks all-green.
 - **Successful push:** preserves `autopilot:autofixed`. The hold is applied before
   publishing AI changes so a label-write failure cannot leave them eligible for
   automerge. If a push fails, the conservative review hold remains. The handoff

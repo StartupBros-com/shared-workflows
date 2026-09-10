@@ -56,9 +56,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # -------- TRIAGE (CI success/skip/neutral): reconcile, classify, optionally merge --------
+  # -------- TRIAGE (everything but the repair set): reconcile, classify, optionally merge --------
+  # Gated on the NEGATION of the repair set below, not an enumerated "known
+  # good" list. GitHub can add new run conclusions at any time (e.g.
+  # `stale`); a positive enumeration here would silently strand any value
+  # neither list names. This job runs for every conclusion that is not
+  # failure-like, so the two gates together exhaustively partition the
+  # space with no fall-through.
   triage:
-    if: ${{ contains(fromJSON('["success","skipped","neutral","cancelled"]'), inputs.ci_conclusion) }}
+    if: ${{ !contains(fromJSON('["failure","timed_out","action_required","startup_failure"]'), inputs.ci_conclusion) }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 8
     outputs:
@@ -150,19 +156,29 @@ jobs:
           # green inventory without at least one genuine successful workflow.
           [ "$successes" -eq 0 ] && allgreen=0
 
-          # A separate, narrower signal for ci_unresolved vs review_held:
-          # `cancelled` is a terminal conclusion (no further event is owed for
-          # it), so once nothing else is genuinely outstanding it must not
-          # strand the PR waiting on an event that will never arrive. Every
-          # other non-green conclusion (failure, timed_out, a still-null
-          # in-flight run, an empty inventory, or zero successes) keeps this
-          # unresolved — only `cancelled` gets the exception.
-          non_cancelled_bad=$(jq '[ .[] | (.conclusion // "pending") ]
-                    | map(select(. != "success" and . != "skipped" and . != "neutral" and . != "cancelled")) | length' <<<"$latest")
+          # A separate, narrower signal for ci_unresolved vs review_held.
+          # `unresolved` means a real future event is still owed for this
+          # head: either a run that has not completed yet (conclusion is
+          # still null), or a run whose conclusion is in the repair set,
+          # because THAT workflow's own completion routes to autofix (a
+          # genuine repair attempt) rather than back through here — handing
+          # off to review now would race that attempt and could starve it
+          # (admission treats an existing pro-review label as another
+          # owner). Every other terminal conclusion (success, skipped,
+          # neutral, cancelled, stale, or any future value) only ever
+          # reconciles here, so once it has already concluded there is
+          # nothing further to wait for.
+          #
+          # Zero genuine successes is NOT, by itself, unresolved: a fully
+          # terminal inventory with no success (e.g. skipped/neutral/
+          # cancelled/stale only) must reconcile to review_held, not be
+          # labelled ci_unresolved forever waiting on an event that already
+          # happened. `allgreen` above is the sole gate on merge eligibility.
+          still_owed=$(jq --argjson repair '["failure","timed_out","action_required","startup_failure"]' '
+                    [ .[] | select(.conclusion == null or (.conclusion as $c | $repair | any(. == $c))) ] | length' <<<"$latest")
           unresolved=0
           [ "$total" -eq 0 ] && unresolved=1
-          [ "$successes" -eq 0 ] && unresolved=1
-          [ "$non_cancelled_bad" -gt 0 ] && unresolved=1
+          [ "$still_owed" -gt 0 ] && unresolved=1
 
           # Refresh before classification and mutation. Compare only the stable
           # safety identity: unrelated labels/display metadata may change, while
@@ -218,13 +234,20 @@ jobs:
             fi
           fi
           if [ "$allgreen" != "1" ]; then tier="review"; reason="${reason}; not all CI green"; fi
-          # A cancelled trigger is never success evidence, even if the freshly
-          # fetched inventory now looks green (e.g. a superseding rerun already
-          # succeeded and this stale event arrived out of order). Force review
-          # the same way an existing auto-fix does, below.
-          if [ "$CI_CONCLUSION" = "cancelled" ]; then
-            tier="review"; reason="${reason}; triggering run was cancelled — not success evidence"
-          fi
+          # The triggering conclusion is success evidence only when it is
+          # literally success, skipped, or neutral — the three conclusions
+          # `bad`/`allgreen` above allow into a green inventory. This is a
+          # closed three-value allowlist for "good", not an open list of
+          # "bad" values to catch, so cancelled, stale, and any conclusion
+          # GitHub adds later all fall into the same forced-review branch.
+          # Force review the same way an existing auto-fix does, below, even
+          # if the freshly fetched inventory now looks green (e.g. a
+          # superseding rerun already succeeded and this event arrived out
+          # of order).
+          case "$CI_CONCLUSION" in
+            success|skipped|neutral) : ;;
+            *) tier="review"; reason="${reason}; triggering run concluded '${CI_CONCLUSION}' — not success evidence" ;;
+          esac
           if jq -e 'any(.labels[]?; .name == "autopilot:autofixed")' "$fresh_file" >/dev/null; then
             tier="review"; reason="contains AI-authored auto-fix — human review required"
           fi
@@ -629,21 +652,6 @@ jobs:
           }
 
           case "$CI_CONCLUSION" in
-            "success"|"skipped"|"neutral"|"cancelled")
-              producer_outcome="$TRIAGE_OUTCOME"
-              [ "$TRIAGE_RESULT" = "success" ] || fail "triage did not finish successfully"
-              case "$producer_outcome" in
-                green_safe) skip "safe green PRs stay in the inexpensive ready queue" ;;
-                review_held) : ;;
-                ci_unresolved) skip "sibling CI is unresolved; defer to its watched completion event" ;;
-                existing_owner) skip "an existing review or active owner already controls this PR" ;;
-                stale_rejected) skip "triage rejected a stale or ineligible target" ;;
-                *) fail "triage returned missing or failed outcome metadata" ;;
-              esac
-              num="$TRIAGE_NUMBER"
-              trigger_sha="$TRIAGE_TRIGGER_SHA"
-              expected_sha="$trigger_sha"
-              ;;
             "failure"|"timed_out"|"action_required"|"startup_failure")
               producer_outcome="$AUTOFIX_OUTCOME"
               # A forced job termination (job-level timeout, lost runner) skips
@@ -685,9 +693,24 @@ jobs:
               trigger_sha="$AUTOFIX_TRIGGER_SHA"
               ;;
             *)
-              # Unknown conclusions do not restart work.
-              producer_outcome="not_applicable"
-              skip "CI conclusion '$CI_CONCLUSION' has no handoff path"
+              # Every other terminal conclusion — success, skipped, neutral,
+              # cancelled, stale, and any value GitHub adds later — reconciles
+              # through triage. There is no enumerated "known good" list and
+              # no silent fall-through: anything outside the tightly-scoped
+              # repair set above lands here, not in a dropped default case.
+              producer_outcome="$TRIAGE_OUTCOME"
+              [ "$TRIAGE_RESULT" = "success" ] || fail "triage did not finish successfully"
+              case "$producer_outcome" in
+                green_safe) skip "safe green PRs stay in the inexpensive ready queue" ;;
+                review_held) : ;;
+                ci_unresolved) skip "sibling CI is unresolved; defer to its watched completion event" ;;
+                existing_owner) skip "an existing review or active owner already controls this PR" ;;
+                stale_rejected) skip "triage rejected a stale or ineligible target" ;;
+                *) fail "triage returned missing or failed outcome metadata" ;;
+              esac
+              num="$TRIAGE_NUMBER"
+              trigger_sha="$TRIAGE_TRIGGER_SHA"
+              expected_sha="$trigger_sha"
               ;;
           esac
 

@@ -155,14 +155,31 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(harness.outputs()["outcome"], "review_held")
         self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
 
-    def test_success_skipped_and_neutral_share_the_reconciliation_path(self):
-        gate = WORKFLOW["jobs"]["triage"]["if"]
-        self.assertIn("success", gate)
-        self.assertIn("skipped", gate)
-        self.assertIn("neutral", gate)
-        handoff_script = step("handoff", "handoff")["run"]
-        self.assertIn('"success"|"skipped"|"neutral"', handoff_script)
+    def test_triage_gate_is_the_negation_of_the_repair_set(self):
+        # There is no enumerated "known good" list for triage/handoff
+        # reconciliation. Its job gate, and the handoff's routing, are both
+        # defined as "not in the tightly-scoped repair set" so the space
+        # stays exhaustively partitioned: any conclusion GitHub adds later
+        # (like the `stale` this fixes) reconciles instead of falling
+        # through to a silent no-op.
+        autofix_expr = WORKFLOW["jobs"]["autofix"]["if"]
+        autofix_match = re.search(
+            r"contains\(fromJSON\('(\[[^)]*\])'\), inputs\.ci_conclusion\)", autofix_expr)
+        self.assertIsNotNone(autofix_match, autofix_expr)
+        repair_set = set(json.loads(autofix_match.group(1)))
+        self.assertEqual(repair_set, {"failure", "timed_out", "action_required", "startup_failure"})
 
+        triage_expr = WORKFLOW["jobs"]["triage"]["if"]
+        triage_match = re.search(
+            r"!contains\(fromJSON\('(\[[^)]*\])'\), inputs\.ci_conclusion\)", triage_expr)
+        self.assertIsNotNone(triage_match, triage_expr)
+        self.assertEqual(set(json.loads(triage_match.group(1))), repair_set)
+
+        handoff_script = step("handoff", "handoff")["run"]
+        self.assertIn('"failure"|"timed_out"|"action_required"|"startup_failure"', handoff_script)
+        self.assertNotIn("no handoff path", handoff_script)
+
+    def test_success_skipped_and_neutral_share_the_reconciliation_path(self):
         cases = (
             ("skipped", "chore(deps): bump pkg from 1.0.0 to 1.0.1", "green_safe"),
             ("neutral", "chore(deps): bump pkg from 1.0.0 to 2.0.0", "review_held"),
@@ -191,7 +208,11 @@ class WorkflowTests(unittest.TestCase):
                 else:
                     self.assertFalse(any("pro-review" in call for call in harness.calls()))
 
-    def test_only_skipped_or_neutral_inventory_is_not_green(self):
+    def test_only_skipped_or_neutral_inventory_reconciles_to_review_held_not_a_forever_hold(self):
+        # A fully terminal inventory (nothing pending, nothing owed) with
+        # zero genuine successes must never be green, but it must also not
+        # be stuck labelled ci_unresolved forever waiting on an event that
+        # already happened — it reconciles to review_held and hands off.
         for conclusion in ("skipped", "neutral"):
             with self.subTest(conclusion=conclusion):
                 harness = self.harness(
@@ -202,7 +223,7 @@ class WorkflowTests(unittest.TestCase):
                 )
                 self.success(harness.run("triage", "triage", MODE="automerge"))
                 producer = harness.outputs()
-                self.assertEqual(producer["outcome"], "ci_unresolved")
+                self.assertEqual(producer["outcome"], "review_held")
                 self.success(self.handoff(
                     harness,
                     CI_CONCLUSION=conclusion,
@@ -211,7 +232,7 @@ class WorkflowTests(unittest.TestCase):
                     TRIAGE_TRIGGER_SHA=producer["trigger_sha"],
                 ))
                 self.assertFalse(any(call[:3] == ["gh", "pr", "merge"] for call in harness.calls()))
-                self.assertFalse(any("pro-review" in call for call in harness.calls()))
+                self.assert_queued(harness)
 
     def test_harmless_late_label_change_does_not_abandon_triage(self):
         harness = self.harness(
@@ -364,68 +385,107 @@ class WorkflowTests(unittest.TestCase):
                 self.success(self.red_handoff(harness, "no_changes", CI_CONCLUSION=conclusion))
                 self.assert_queued(harness)
 
-    def test_unknown_ci_conclusions_have_no_handoff_path(self):
-        harness = self.harness()
-        result = self.handoff(harness, CI_CONCLUSION="an_unforeseen_future_conclusion",
-                              TRIAGE_RESULT="skipped", TRIAGE_OUTCOME="",
-                              TRIAGE_NUMBER="", TRIAGE_TRIGGER_SHA="",
-                              AUTOFIX_RESULT="skipped", AUTOFIX_OUTCOME="",
-                              AUTOFIX_NUMBER="", AUTOFIX_TRIGGER_SHA="")
-        self.success(result)
-        self.assertIn("has no handoff path", harness.summary.read_text())
-        self.assertNotIn("Handoff: queued", harness.summary.read_text())
-        self.assertEqual(self.mutation_calls(harness), [])
+    # Round 3 found skipped/neutral unhandled, round 4 found cancelled
+    # unhandled, round 5 found stale unhandled. GitHub can add conclusion
+    # values at any time, so an enumerated "known bad, everything else is
+    # fine" list can never be complete. These cases are NOT tested one at a
+    # time as new gaps are discovered — NON_REPAIR_NON_SUCCESS_CONCLUSIONS
+    # includes an invented value alongside the two real ones this fixed, so
+    # each test below is already a regression guard for the whole family.
+    NON_REPAIR_NON_SUCCESS_CONCLUSIONS = ("cancelled", "stale", "some_future_conclusion")
 
-    def test_triage_gate_and_handoff_now_reconcile_cancelled_completions(self):
-        gate = WORKFLOW["jobs"]["triage"]["if"]
-        self.assertIn("cancelled", gate)
-        handoff_script = step("handoff", "handoff")["run"]
-        self.assertIn('"success"|"skipped"|"neutral"|"cancelled"', handoff_script)
+    def test_unforeseen_conclusion_reaches_a_definite_owner_not_a_silent_no_op(self):
+        # The point of this change: a conclusion value that appears nowhere
+        # in the workflow source must still reach a definite owner rather
+        # than fall through to a silent no-op. This must fail against an
+        # open-enumeration implementation.
+        conclusion = "some_future_conclusion"
+        workflow_text = (ROOT / ".github/workflows/dependency-autopilot.yml").read_text()
+        self.assertNotIn(conclusion, workflow_text)
 
-    def test_cancelled_trigger_never_reaches_green_safe_or_merges(self):
-        # Inventory looks fully green (e.g. a superseding rerun already
-        # succeeded), but THIS event is the cancelled completion itself —
-        # cancellation is not success evidence, so it must still force review.
         harness = self.harness(prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")])
-        self.success(harness.run("triage", "triage", CI_CONCLUSION="cancelled", MODE="automerge"))
-        self.assertEqual(harness.outputs()["outcome"], "review_held")
+        self.success(harness.run("triage", "triage", CI_CONCLUSION=conclusion, MODE="automerge"))
+        producer = harness.outputs()
+        # Not success evidence: forced to review, never merged, even though
+        # the title alone would otherwise be a safe single-version bump.
+        self.assertEqual(producer["outcome"], "review_held")
         self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
 
-    def test_cancelled_sibling_reconciles_to_review_held_instead_of_stranding_the_hold(self):
-        # A prior event would have held this as ci_unresolved awaiting the
-        # sibling; once the sibling's own cancellation is the ONLY unresolved
-        # item (a genuine success already exists, nothing is still pending),
-        # reconciliation must terminate the hold rather than defer to an
-        # event that will never arrive.
-        harness = self.harness(
-            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
-            runs={"workflow_runs": [
-                {"workflow_id": 1, "run_number": 1, "conclusion": "success"},
-                {"workflow_id": 2, "run_number": 1, "conclusion": "cancelled"},
-            ]},
-        )
-        self.success(harness.run("triage", "triage", CI_CONCLUSION="cancelled"))
-        producer = harness.outputs()
-        self.assertEqual(producer["outcome"], "review_held")
         self.success(self.handoff(
-            harness, CI_CONCLUSION="cancelled",
+            harness, CI_CONCLUSION=conclusion,
             TRIAGE_OUTCOME=producer["outcome"], TRIAGE_NUMBER=producer["number"],
             TRIAGE_TRIGGER_SHA=producer["trigger_sha"],
         ))
         self.assert_queued(harness)
 
-    def test_cancelled_sibling_with_a_still_pending_run_stays_deferred(self):
+    def test_non_success_trigger_never_reaches_green_safe_or_merges(self):
+        # Inventory looks fully green (e.g. a superseding rerun already
+        # succeeded), but THIS event's own conclusion is not success —
+        # never treated as success evidence, so it must still force review.
+        for conclusion in self.NON_REPAIR_NON_SUCCESS_CONCLUSIONS:
+            with self.subTest(conclusion=conclusion):
+                harness = self.harness(prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")])
+                self.success(harness.run("triage", "triage", CI_CONCLUSION=conclusion, MODE="automerge"))
+                self.assertEqual(harness.outputs()["outcome"], "review_held")
+                self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+
+    def test_non_success_sibling_reconciles_to_review_held_instead_of_stranding_the_hold(self):
+        # A prior event would have held this as ci_unresolved awaiting the
+        # sibling; once the sibling's own non-repair terminal conclusion is
+        # the ONLY unresolved item (a genuine success already exists,
+        # nothing is still pending or still owed a repair attempt),
+        # reconciliation must terminate the hold rather than defer to an
+        # event that will never arrive.
+        for conclusion in self.NON_REPAIR_NON_SUCCESS_CONCLUSIONS:
+            with self.subTest(conclusion=conclusion):
+                harness = self.harness(
+                    prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+                    runs={"workflow_runs": [
+                        {"workflow_id": 1, "run_number": 1, "conclusion": "success"},
+                        {"workflow_id": 2, "run_number": 1, "conclusion": conclusion},
+                    ]},
+                )
+                self.success(harness.run("triage", "triage", CI_CONCLUSION=conclusion))
+                producer = harness.outputs()
+                self.assertEqual(producer["outcome"], "review_held")
+                self.success(self.handoff(
+                    harness, CI_CONCLUSION=conclusion,
+                    TRIAGE_OUTCOME=producer["outcome"], TRIAGE_NUMBER=producer["number"],
+                    TRIAGE_TRIGGER_SHA=producer["trigger_sha"],
+                ))
+                self.assert_queued(harness)
+
+    def test_non_success_sibling_with_a_still_pending_run_stays_deferred(self):
         # A genuinely pending (uncompleted) sibling still owes a real future
         # event, so the hold must remain ci_unresolved, not jump to review.
+        for conclusion in self.NON_REPAIR_NON_SUCCESS_CONCLUSIONS:
+            with self.subTest(conclusion=conclusion):
+                harness = self.harness(
+                    prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+                    runs={"workflow_runs": [
+                        {"workflow_id": 1, "run_number": 1, "conclusion": "success"},
+                        {"workflow_id": 2, "run_number": 1, "conclusion": conclusion},
+                        {"workflow_id": 3, "run_number": 1, "conclusion": None},
+                    ]},
+                )
+                self.success(harness.run("triage", "triage", CI_CONCLUSION=conclusion))
+                self.assertEqual(harness.outputs()["outcome"], "ci_unresolved")
+
+    def test_failure_like_sibling_still_defers_to_its_own_repair_attempt(self):
+        # A sibling with a repair-set conclusion (failure/timed_out/etc.) is
+        # terminal too, but unlike cancelled/stale/unknown it owns a
+        # SEPARATE event that routes to autofix, a genuine repair attempt.
+        # Handing off to review now would race that attempt and could starve
+        # it (admission treats an existing pro-review label as another
+        # owner). This must stay ci_unresolved, not review_held.
         harness = self.harness(
             prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
             runs={"workflow_runs": [
                 {"workflow_id": 1, "run_number": 1, "conclusion": "success"},
-                {"workflow_id": 2, "run_number": 1, "conclusion": "cancelled"},
-                {"workflow_id": 3, "run_number": 1, "conclusion": None},
+                {"workflow_id": 2, "run_number": 1, "conclusion": "failure"},
             ]},
         )
-        self.success(harness.run("triage", "triage", CI_CONCLUSION="cancelled"))
+        self.success(harness.run("triage", "triage"))
         self.assertEqual(harness.outputs()["outcome"], "ci_unresolved")
 
     def test_forced_termination_with_bound_metadata_falls_back_to_failed_execution(self):
