@@ -205,6 +205,7 @@ class ShellHarness:
             "RUN_ID": "9001",
             "GH_TOKEN": "test-token",
             "MODE": "queue",
+            "CI_CONCLUSION": "success",
             "CODEX_AUTH": "test-auth",
             "APP_ID": "123",
             "APP_PRIVATE_KEY": "test-key",

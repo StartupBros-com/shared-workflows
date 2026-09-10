@@ -364,19 +364,69 @@ class WorkflowTests(unittest.TestCase):
                 self.success(self.red_handoff(harness, "no_changes", CI_CONCLUSION=conclusion))
                 self.assert_queued(harness)
 
-    def test_cancelled_and_unknown_ci_conclusions_have_no_handoff_path(self):
-        for conclusion in ("cancelled", "an_unforeseen_future_conclusion"):
-            with self.subTest(conclusion=conclusion):
-                harness = self.harness()
-                result = self.handoff(harness, CI_CONCLUSION=conclusion,
-                                      TRIAGE_RESULT="skipped", TRIAGE_OUTCOME="",
-                                      TRIAGE_NUMBER="", TRIAGE_TRIGGER_SHA="",
-                                      AUTOFIX_RESULT="skipped", AUTOFIX_OUTCOME="",
-                                      AUTOFIX_NUMBER="", AUTOFIX_TRIGGER_SHA="")
-                self.success(result)
-                self.assertIn("has no handoff path", harness.summary.read_text())
-                self.assertNotIn("Handoff: queued", harness.summary.read_text())
-                self.assertEqual(self.mutation_calls(harness), [])
+    def test_unknown_ci_conclusions_have_no_handoff_path(self):
+        harness = self.harness()
+        result = self.handoff(harness, CI_CONCLUSION="an_unforeseen_future_conclusion",
+                              TRIAGE_RESULT="skipped", TRIAGE_OUTCOME="",
+                              TRIAGE_NUMBER="", TRIAGE_TRIGGER_SHA="",
+                              AUTOFIX_RESULT="skipped", AUTOFIX_OUTCOME="",
+                              AUTOFIX_NUMBER="", AUTOFIX_TRIGGER_SHA="")
+        self.success(result)
+        self.assertIn("has no handoff path", harness.summary.read_text())
+        self.assertNotIn("Handoff: queued", harness.summary.read_text())
+        self.assertEqual(self.mutation_calls(harness), [])
+
+    def test_triage_gate_and_handoff_now_reconcile_cancelled_completions(self):
+        gate = WORKFLOW["jobs"]["triage"]["if"]
+        self.assertIn("cancelled", gate)
+        handoff_script = step("handoff", "handoff")["run"]
+        self.assertIn('"success"|"skipped"|"neutral"|"cancelled"', handoff_script)
+
+    def test_cancelled_trigger_never_reaches_green_safe_or_merges(self):
+        # Inventory looks fully green (e.g. a superseding rerun already
+        # succeeded), but THIS event is the cancelled completion itself —
+        # cancellation is not success evidence, so it must still force review.
+        harness = self.harness(prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")])
+        self.success(harness.run("triage", "triage", CI_CONCLUSION="cancelled", MODE="automerge"))
+        self.assertEqual(harness.outputs()["outcome"], "review_held")
+        self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+
+    def test_cancelled_sibling_reconciles_to_review_held_instead_of_stranding_the_hold(self):
+        # A prior event would have held this as ci_unresolved awaiting the
+        # sibling; once the sibling's own cancellation is the ONLY unresolved
+        # item (a genuine success already exists, nothing is still pending),
+        # reconciliation must terminate the hold rather than defer to an
+        # event that will never arrive.
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            runs={"workflow_runs": [
+                {"workflow_id": 1, "run_number": 1, "conclusion": "success"},
+                {"workflow_id": 2, "run_number": 1, "conclusion": "cancelled"},
+            ]},
+        )
+        self.success(harness.run("triage", "triage", CI_CONCLUSION="cancelled"))
+        producer = harness.outputs()
+        self.assertEqual(producer["outcome"], "review_held")
+        self.success(self.handoff(
+            harness, CI_CONCLUSION="cancelled",
+            TRIAGE_OUTCOME=producer["outcome"], TRIAGE_NUMBER=producer["number"],
+            TRIAGE_TRIGGER_SHA=producer["trigger_sha"],
+        ))
+        self.assert_queued(harness)
+
+    def test_cancelled_sibling_with_a_still_pending_run_stays_deferred(self):
+        # A genuinely pending (uncompleted) sibling still owes a real future
+        # event, so the hold must remain ci_unresolved, not jump to review.
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            runs={"workflow_runs": [
+                {"workflow_id": 1, "run_number": 1, "conclusion": "success"},
+                {"workflow_id": 2, "run_number": 1, "conclusion": "cancelled"},
+                {"workflow_id": 3, "run_number": 1, "conclusion": None},
+            ]},
+        )
+        self.success(harness.run("triage", "triage", CI_CONCLUSION="cancelled"))
+        self.assertEqual(harness.outputs()["outcome"], "ci_unresolved")
 
     def test_forced_termination_with_bound_metadata_falls_back_to_failed_execution(self):
         harness = self.harness()
@@ -410,7 +460,10 @@ class WorkflowTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(self.mutation_calls(harness), [])
 
-    def test_successful_repair_is_held_before_push_and_hands_off_new_head(self):
+    def test_successful_repair_is_held_before_push_and_does_not_hand_off_itself(self):
+        # The push uses a short-lived token and genuinely re-triggers CI on
+        # the new head; the repaired head's OWN CI completion selects the
+        # next owner, not this producer's terminal handoff.
         harness = self.harness(changed_files=["src/app.ts"], remote_sha=OLD_SHA, pushed_sha=NEW_SHA)
         self.success(harness.run("autofix", "pre"))
         pre = harness.outputs()
@@ -425,13 +478,18 @@ class WorkflowTests(unittest.TestCase):
                                  GUARD_OUTCOME=guard["outcome"], PUSH_OUTCOME=push["outcome"],
                                  FLAG_STATUS="success", FLAGGED=flag["flagged"]))
         outcome = harness.outputs()["outcome"]
-        self.success(self.red_handoff(harness, outcome, AUTOFIX_PUSHED_SHA=push["pushed_sha"]))
-        self.assert_queued(harness)
+        self.assertEqual(outcome, "successful_push")
         calls = harness.calls()
         held = next(i for i, c in enumerate(calls) if c[:3] == ["gh", "pr", "edit"] and "autopilot:autofixed" in c)
         pushed = next(i for i, c in enumerate(calls) if c[:2] == ["git", "push"])
         self.assertLess(held, pushed)
         self.assertFalse(any(c[0] == "git" and "-A" in c for c in calls))
+
+        before = self.mutation_calls(harness)
+        self.success(self.red_handoff(harness, outcome, AUTOFIX_PUSHED_SHA=push["pushed_sha"]))
+        self.assertEqual(self.mutation_calls(harness), before)
+        self.assertNotIn("Handoff: queued", harness.summary.read_text())
+        self.assertIn("own CI completion selects the next owner", harness.summary.read_text())
 
     def test_stale_remote_head_rejects_the_push_without_mutating_git(self):
         harness = self.harness(changed_files=["src/app.ts"], remote_sha=NEW_SHA, pushed_sha=NEW_SHA)
@@ -441,7 +499,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(any(c[0] == "git" and c[1] in ("add", "commit", "push") for c in harness.calls()))
 
     def test_stale_or_owned_autofix_outcomes_skip_handoff_without_mutation(self):
-        for outcome in ("stale_rejected", "existing_owner"):
+        for outcome in ("stale_rejected", "existing_owner", "successful_push"):
             with self.subTest(outcome=outcome):
                 harness = self.harness()
                 self.success(self.red_handoff(harness, outcome))
@@ -527,6 +585,55 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(harness.outputs()["outcome"], "unavailable_credentials")
         self.assertEqual(harness.outputs()["trigger_sha"], OLD_SHA)
         self.assertEqual(self.mutation_calls(harness), [])
+
+    def test_a_prior_autofix_label_refuses_a_second_repair_attempt(self):
+        harness = self.harness(prs=[trusted_pr(labels=[{"name": "autopilot:autofixed"}])])
+        self.success(harness.run("autofix", "pre"))
+        self.assertEqual(harness.outputs()["outcome"], "already_repaired")
+        self.assertEqual(harness.outputs()["ok"], "0")
+        self.assertEqual(self.mutation_calls(harness), [])
+        self.assertFalse(any(c[0] == "codex" for c in harness.calls()))
+
+    def test_two_consecutive_red_completions_produce_exactly_one_repair_then_a_review_owner(self):
+        harness = self.harness(changed_files=["src/app.ts"], remote_sha=OLD_SHA, pushed_sha=NEW_SHA)
+
+        # First red completion: no prior auto-fix exists, so repair is
+        # admitted, runs, and pushes a fix (re-triggering CI on the new head).
+        self.success(harness.run("autofix", "pre"))
+        pre = harness.outputs()
+        self.assertEqual(pre["outcome"], "admitted")
+        self.success(harness.run("autofix", "codex"))
+        self.success(harness.run("autofix", "guard"))
+        guard = harness.outputs()
+        self.success(harness.run("autofix", "flag", NUM=pre["number"], TRIGGER_SHA=pre["trigger_sha"]))
+        flag = harness.outputs()
+        self.success(harness.run("autofix", "push", TRIGGER_SHA=pre["trigger_sha"], PUSH_TOKEN="test-push-token"))
+        push = harness.outputs()
+        self.success(harness.run("autofix", "result", PRE_OUTCOME=pre["outcome"], CODEX_STATUS="success",
+                                 GUARD_OUTCOME=guard["outcome"], PUSH_OUTCOME=push["outcome"],
+                                 FLAG_STATUS="success", FLAGGED=flag["flagged"]))
+        self.assertEqual(harness.outputs()["outcome"], "successful_push")
+        self.assertEqual(sum(c[0] == "codex" for c in harness.calls()), 1)
+
+        # Second red completion on the repaired (now autopilot:autofixed) head:
+        # admission must refuse a second repair outright — no second Codex run.
+        self.success(harness.run("autofix", "pre"))
+        second_pre = harness.outputs()
+        self.assertEqual(second_pre["outcome"], "already_repaired")
+        self.assertEqual(sum(c[0] == "codex" for c in harness.calls()), 1)
+
+        self.success(harness.run("autofix", "result", PRE_OUTCOME="already_repaired", CODEX_STATUS="",
+                                 GUARD_OUTCOME="", PUSH_OUTCOME="", FLAG_STATUS="", FLAGGED=""))
+        self.assertEqual(harness.outputs()["outcome"], "already_repaired")
+
+        # The still-red, already-repaired PR reconciles to a review owner.
+        # The second completion's own triggering run is on the repaired head.
+        config = json.loads(harness.config.read_text())
+        config["run"] = RUN | {"headSha": second_pre["trigger_sha"]}
+        harness.config.write_text(json.dumps(config))
+        self.success(self.red_handoff(harness, "already_repaired", AUTOFIX_NUMBER=second_pre["number"],
+                                      AUTOFIX_TRIGGER_SHA=second_pre["trigger_sha"]))
+        self.assert_queued(harness)
 
     def test_all_trusted_bot_login_forms_are_admitted(self):
         for login in ("app/dependabot", "dependabot[bot]", "app/startupbros-autopilot", "startupbros-autopilot[bot]"):
@@ -671,7 +778,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_red_unresolved_outcomes_queue_after_independent_revalidation(self):
         for outcome, status in (("no_changes", "success"), ("unavailable_credentials", "success"),
-                                ("failed_execution", "failure")):
+                                ("failed_execution", "failure"), ("already_repaired", "success")):
             with self.subTest(outcome=outcome):
                 harness = self.harness()
                 self.success(self.red_handoff(harness, outcome, AUTOFIX_RESULT=status))
@@ -684,12 +791,12 @@ class WorkflowTests(unittest.TestCase):
                                             AUTOFIX_TRIGGER_SHA="").returncode, 0)
         self.assertEqual(self.mutation_calls(harness), [])
 
-    def test_successful_push_hands_off_new_head_not_trigger_head(self):
+    def test_successful_push_never_hands_off_regardless_of_current_head(self):
         harness = self.harness(prs=[trusted_pr(headRefOid=NEW_SHA)])
-        self.success(self.red_handoff(harness, "successful_push", AUTOFIX_PUSHED_SHA=NEW_SHA))
-        self.assert_queued(harness)
-        comments = [c for c in harness.calls() if c[:3] == ["gh", "pr", "comment"]]
-        self.assertIn(NEW_SHA, comments[0][-1])
+        result = self.red_handoff(harness, "successful_push", AUTOFIX_PUSHED_SHA=NEW_SHA)
+        self.success(result)
+        self.assertEqual(self.mutation_calls(harness), [])
+        self.assertNotIn("Handoff: queued", harness.summary.read_text())
 
     def test_result_step_distinguishes_execution_and_no_change(self):
         for codex_status, guard_outcome, expected in (

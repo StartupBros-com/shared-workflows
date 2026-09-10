@@ -8,18 +8,26 @@ A shared dependency workflow, called after a repository's PR CI finishes:
 
 ```text
 Dependabot / Renovate PR -> CI completes
-  success / skipped / neutral -> reconcile the latest watched-workflow inventory
-    no genuine success, or sibling CI unresolved -> keep the conservative hold;
-      defer handoff
+  success / skipped / neutral / cancelled -> reconcile the latest watched-workflow
+      inventory (a cancelled trigger is forced to tier=review; it can only reach
+      review_held or ci_unresolved, never green_safe or a merge)
+    no genuine success, or a non-cancelled sibling still unresolved -> keep the
+      conservative hold; defer handoff
     all accepted + at least one success + safe -> existing ready queue (or merge
       when caller selects automerge)
     all accepted + at least one success + held -> existing pro-review daemon
   red (failure, timed_out, action_required, startup_failure) -> bounded
-      application-code repair
-    pushed -> hold for review, rerun CI, hand off the new head
-    no changes / unavailable credentials / failed execution -> hand off the
-      unchanged PR only if its identity and source CI can be revalidated
-  cancelled / anything else -> no handoff path; does not restart work
+      application-code repair, unless the PR already carries
+      `autopilot:autofixed` (one repair attempt only) -> reconciles straight to
+      the terminal handoff instead
+    pushed -> hold for review before publishing, then skip the handoff for this
+      SHA; the pushed head re-fires its own CI, and that completion (forced to
+      tier=review by the `autopilot:autofixed` label) selects the next owner
+    no changes / unavailable credentials / failed execution / already-repaired ->
+      hand off the unchanged PR only if its identity and source CI can be
+      revalidated
+  anything else (unknown/other conclusions) -> no handoff path; does not restart
+      work
 ```
 
 The workflow serializes all producer and handoff jobs for a caller's PR branch.
@@ -84,12 +92,28 @@ expected, not evidence of a dependency-workflow outage.
 - **CI unresolved:** retains the conservative `autopilot:review` hold but does not
   request Pro review. Handoff waits for a watched missing, pending, or failed
   sibling workflow to complete; this requires the caller's `workflows:` list to
-  include every PR-triggered CI workflow.
+  include every PR-triggered CI workflow. A `cancelled` sibling is terminal and
+  does not keep the hold waiting forever: once every other watched run is
+  genuinely resolved and at least one is a real success, the reconciliation
+  proceeds to `review_held` instead of staying stuck on a completion that will
+  never arrive. `cancelled` itself is never counted as that success.
 - **Review held:** only an all-green risk hold is eligible for the existing
-  `pro-review` intake after fresh checks.
+  `pro-review` intake after fresh checks. A `cancelled` triggering conclusion is
+  always forced to this tier (or to `ci_unresolved`) — it is never treated as
+  success evidence and can never reach `green_safe` or a merge, even if the
+  freshly fetched inventory now looks all-green.
 - **Successful push:** preserves `autopilot:autofixed`. The hold is applied before
   publishing AI changes so a label-write failure cannot leave them eligible for
-  automerge. If a push fails, the conservative review hold remains.
+  automerge. If a push fails, the conservative review hold remains. The handoff
+  does **not** hand off this pushed SHA: it was published with a short-lived
+  GitHub App token, so CI genuinely re-fires on the new head, and
+  `autopilot:autofixed` already forces that head's own completion to
+  tier=review. Handing off the pre-rerun SHA would race that CI and could
+  strand the repair with no active owner if the rerun then failed.
+- **Already repaired:** a PR that already carries `autopilot:autofixed` has had
+  its one repair attempt. A second red completion on that PR does not start a
+  second repair; auto-fix admission refuses it and reconciles straight to the
+  terminal handoff so the still-red head goes to review instead of looping.
 - **No changes:** distinct from execution failure; it does not mean the CI failure
   was repaired.
 - **Unavailable credentials:** the optional repair cannot run, but the unchanged
