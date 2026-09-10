@@ -196,7 +196,9 @@ class WorkflowTests(unittest.TestCase):
                         {"workflow_id": 1, "run_number": 1, "conclusion": conclusion},
                     ]},
                 )
-                self.success(harness.run("triage", "triage", MODE="automerge"))
+                self.success(harness.run(
+                    "triage", "triage", MODE="automerge", AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+                ))
                 producer = harness.outputs()
                 self.assertEqual(producer["outcome"], "review_held")
                 self.success(self.handoff(
@@ -300,17 +302,29 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
 
     def test_empty_run_inventory_is_never_treated_as_all_green(self):
+        # An inventory that is STILL empty after the bounded currency
+        # retries has no observed pending run and no observed repair-set
+        # sibling — there is no future event left to complete and
+        # re-trigger this workflow, so ci_unresolved (whose handoff path
+        # deliberately no-ops, awaiting that event) would strand the PR
+        # forever. It must reach a definite owner (review_held) instead.
         harness = self.harness(
             prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
             run_pages=[{"workflow_runs": []}],
         )
-        self.success(harness.run("triage", "triage", MODE="automerge"))
+        self.success(harness.run(
+            "triage", "triage", MODE="automerge", AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+        ))
         producer = harness.outputs()
-        self.assertEqual(producer["outcome"], "ci_unresolved")
-        self.success(self.handoff(harness, TRIAGE_OUTCOME=producer["outcome"]))
-        self.assertIn("sibling CI is unresolved", harness.summary.read_text())
-        self.assertFalse(any("pro-review" in c for c in harness.calls()))
+        self.assertEqual(producer["outcome"], "review_held")
+        self.success(self.handoff(
+            harness,
+            TRIAGE_OUTCOME=producer["outcome"],
+            TRIAGE_NUMBER=producer["number"],
+            TRIAGE_TRIGGER_SHA=producer["trigger_sha"],
+        ))
         self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+        self.assert_queued(harness)
 
     def test_triage_stops_if_ownership_or_head_changes_before_mutation(self):
         cases = (
@@ -379,7 +393,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn(conclusion, workflow_text)
 
         harness = self.harness(prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")])
-        self.success(harness.run("triage", "triage", CI_CONCLUSION=conclusion, MODE="automerge"))
+        self.success(harness.run(
+            "triage", "triage", CI_CONCLUSION=conclusion, MODE="automerge",
+            AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+        ))
         producer = harness.outputs()
         # Not success evidence: forced to review, never merged, even though
         # the title alone would otherwise be a safe single-version bump.
@@ -400,7 +417,10 @@ class WorkflowTests(unittest.TestCase):
         for conclusion in self.NON_REPAIR_NON_SUCCESS_CONCLUSIONS:
             with self.subTest(conclusion=conclusion):
                 harness = self.harness(prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")])
-                self.success(harness.run("triage", "triage", CI_CONCLUSION=conclusion, MODE="automerge"))
+                self.success(harness.run(
+                    "triage", "triage", CI_CONCLUSION=conclusion, MODE="automerge",
+                    AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+                ))
                 self.assertEqual(harness.outputs()["outcome"], "review_held")
                 self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
 
@@ -442,9 +462,81 @@ class WorkflowTests(unittest.TestCase):
                     run=RUN | {"workflowDatabaseId": 1, "number": 11, "conclusion": "cancelled"},
                     runs={"workflow_runs": [entry]},
                 )
-                self.success(harness.run("triage", "triage", CI_CONCLUSION="cancelled", MODE="automerge"))
+                self.success(harness.run(
+                    "triage", "triage", CI_CONCLUSION="cancelled", MODE="automerge",
+                    AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+                ))
                 self.assertEqual(harness.outputs()["outcome"], "review_held")
                 self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+
+    def test_rerun_reusing_the_run_number_with_a_newer_attempt_never_proves_green(self):
+        # MERGE-SAFETY regression (round 9, Symptom A): a rerun REUSES the
+        # triggering run's run_number while incrementing run_attempt. If
+        # attempt 1 emitted the triggering success and attempt 2 has since
+        # failed, an eventually-consistent run-list can still expose
+        # attempt 1's success under the SAME run_number — round 8's fix
+        # (run_number only) cannot see this, and a safe-tier PR must not
+        # reach green_safe or merge on a stale attempt's success.
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            run=RUN | {"workflowDatabaseId": 1, "number": 11, "attempt": 2, "conclusion": "failure"},
+            runs={"workflow_runs": [
+                {"workflow_id": 1, "run_number": 11, "run_attempt": 1, "conclusion": "success"},
+            ]},
+        )
+        self.success(harness.run(
+            "triage", "triage", CI_CONCLUSION="success", MODE="automerge",
+            AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+        ))
+        outputs = harness.outputs()
+        self.assertNotEqual(outputs["outcome"], "green_safe")
+        self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+
+    def test_matching_run_number_and_attempt_with_a_differing_live_conclusion_is_lagging(self):
+        # Same run_number AND same attempt as the live trigger (so neither
+        # the run_number check nor the t_concl-vs-CI_CONCLUSION supersession
+        # signal fires), but the inventory's recorded conclusion for that
+        # exact attempt disagrees with the live read (here: a stale
+        # "skipped" where the live run is actually "success"). A second,
+        # genuinely green sibling supplies the one-success requirement so
+        # only the conclusion mismatch itself is under test — this must
+        # still be treated as lagging, not current, and must not prove
+        # green or merge.
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            run=RUN | {"workflowDatabaseId": 1, "number": 11, "attempt": 1, "conclusion": "success"},
+            runs={"workflow_runs": [
+                {"workflow_id": 1, "run_number": 11, "run_attempt": 1, "conclusion": "skipped"},
+                {"workflow_id": 2, "run_number": 1, "conclusion": "success"},
+            ]},
+        )
+        self.success(harness.run(
+            "triage", "triage", CI_CONCLUSION="success", MODE="automerge",
+            AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+        ))
+        outputs = harness.outputs()
+        self.assertNotEqual(outputs["outcome"], "green_safe")
+        self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+
+    def test_fully_matching_inventory_number_attempt_and_conclusion_classifies_as_current(self):
+        # The happy path is unchanged: when run_number, run_attempt, and
+        # conclusion in the inventory all agree with the live trigger read,
+        # currency is proven exactly as before attempt/conclusion binding
+        # was added, and a safe-tier PR still reaches green_safe and merges.
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            run=RUN | {"workflowDatabaseId": 1, "number": 11, "attempt": 2, "conclusion": "success"},
+            runs={"workflow_runs": [
+                {"workflow_id": 1, "run_number": 11, "run_attempt": 2, "conclusion": "success"},
+            ]},
+        )
+        self.success(harness.run(
+            "triage", "triage", CI_CONCLUSION="success", MODE="automerge",
+            AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+        ))
+        outputs = harness.outputs()
+        self.assertEqual(outputs["outcome"], "green_safe")
+        self.assertTrue(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
 
     def test_non_success_sibling_reconciles_to_review_held_instead_of_stranding_the_hold(self):
         # A prior event would have held this as ci_unresolved awaiting the
@@ -462,7 +554,10 @@ class WorkflowTests(unittest.TestCase):
                         {"workflow_id": 2, "run_number": 1, "conclusion": conclusion},
                     ]},
                 )
-                self.success(harness.run("triage", "triage", CI_CONCLUSION=conclusion))
+                self.success(harness.run(
+                    "triage", "triage", CI_CONCLUSION=conclusion,
+                    AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+                ))
                 producer = harness.outputs()
                 self.assertEqual(producer["outcome"], "review_held")
                 self.success(self.handoff(
@@ -485,7 +580,10 @@ class WorkflowTests(unittest.TestCase):
                         {"workflow_id": 3, "run_number": 1, "conclusion": None},
                     ]},
                 )
-                self.success(harness.run("triage", "triage", CI_CONCLUSION=conclusion))
+                self.success(harness.run(
+                    "triage", "triage", CI_CONCLUSION=conclusion,
+                    AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+                ))
                 self.assertEqual(harness.outputs()["outcome"], "ci_unresolved")
 
     def test_failure_like_sibling_still_defers_to_its_own_repair_attempt(self):

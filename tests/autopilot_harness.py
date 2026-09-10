@@ -191,9 +191,17 @@ if name == "gh":
             print(json.dumps({"name": endpoint.rsplit("/", 1)[1]}))
         else:
             default_runs = {"workflow_runs": [
-                {"workflow_id": 1, "run_number": 1, "conclusion": "success"},
+                {"workflow_id": 1, "run_number": 1, "run_attempt": 1, "conclusion": "success"},
             ]}
             pages = config.get("run_pages", [config.get("runs", default_runs)])
+            # A fixture that specifies workflow_runs without run_attempt
+            # (nearly every pre-existing test — this field predates
+            # attempt-bound currency checking) defaults to attempt 1, the
+            # same default `gh run view` uses above, so an unrelated test's
+            # currency stays trivially "current" by construction.
+            for page in pages:
+                for entry in page.get("workflow_runs", []):
+                    entry.setdefault("run_attempt", 1)
             if "--slurp" in args:
                 print(json.dumps(pages))
             else:

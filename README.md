@@ -120,6 +120,23 @@ expected, not evidence of a dependency-workflow outage.
   never arrive. This holds even for a fully terminal inventory with zero
   genuine successes (e.g. skipped/neutral/cancelled/stale only) — it reconciles
   to `review_held`, not an eternal `ci_unresolved`.
+
+  Reaching `unresolved` at all requires an *actually observed* pending run or
+  repair-set sibling in the freshly fetched inventory — never merely an
+  inventory that failed to prove itself current. The triggering run's own
+  identity is re-bound to its live `run_number`, `run_attempt`, and
+  `conclusion` together, not `run_number` alone: a rerun reuses the same
+  `run_number` while incrementing the attempt, so a matching run_number can
+  still expose a stale earlier attempt's conclusion under an
+  eventually-consistent list. Such a mismatch is treated as lagging, forcing
+  the head non-green so a stale success can never clear the safe-tier merge
+  gate. An empty or still-lagging inventory for the triggering workflow is
+  retried a bounded number of times (`AUTOPILOT_CURRENCY_RETRY_SECONDS`, the
+  same knob autofix's own currency retry uses); if it is still empty or still
+  behind after the bound, that is not treated as an owed future event either
+  — it reconciles to `review_held`, a definite owner, rather than being
+  labelled `ci_unresolved` and left on a hold with no repair or review owner
+  because nothing was actually observed to still be pending.
   - **Known boundary:** `still_owed` has no time bound — a repair-set sibling
     is owed for as long as it stays in the repair set, full stop. A bounded
     (time-based) version of this was tried and reverted: it cannot tell "the
