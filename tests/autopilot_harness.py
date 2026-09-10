@@ -86,6 +86,72 @@ def same_repo_filter_blocks():
     return blocks["triage"], blocks["autofix"], blocks["handoff"]
 
 
+# Round-12 P0: head-SHA equality (checked just above each copy of this
+# block) is provenance-blind to WHICH repository produced that commit — a
+# public fork can push the identical dependency-bump commit on a
+# same-named branch, giving its own `pull_request` CI run the SAME head
+# SHA as the legitimate PR. All three call sites (triage's "triage" step,
+# autofix's "pre" step, handoff's "handoff" step) confirm the triggering
+# run's own head_repository and head_branch before treating it as
+# provenance, wrapped in a matching
+# `# autopilot-fork-provenance-gate:begin/:end` marker pair, the same
+# byte-equality pattern as SAME_REPO_FILTER_PATTERN above.
+FORK_PROVENANCE_GATE_PATTERN = re.compile(
+    r"# autopilot-fork-provenance-gate:begin\n(.*?)"
+    r"# autopilot-fork-provenance-gate:end\n",
+    re.S,
+)
+
+
+def fork_provenance_gate_blocks():
+    """Extract the triage, autofix, and handoff copies of the shared
+    fork-provenance admission gate. Each call site's `run:` script must
+    contain the marker pair exactly once; a missing or duplicated marker
+    fails loudly here rather than silently comparing the wrong (or no)
+    text."""
+    triage_script = step("triage", "triage")["run"]
+    autofix_script = step("autofix", "pre")["run"]
+    handoff_script = step("handoff", "handoff")["run"]
+    blocks = {}
+    for name, script in (("triage", triage_script), ("autofix", autofix_script), ("handoff", handoff_script)):
+        found = FORK_PROVENANCE_GATE_PATTERN.findall(script)
+        assert len(found) == 1, (name, script)
+        blocks[name] = found[0]
+    return blocks["triage"], blocks["autofix"], blocks["handoff"]
+
+
+# Round-12 P1: `gh pr list --head` defaults to a 30-item cap with no
+# server-side owner scoping, so an attacker opening more fork PRs than the
+# cap on this predictable branch name can crowd the legitimate same-repo
+# PR out of the result set entirely, before the same-repo filter ever
+# runs. All three PR-lookup sites (triage's "triage" step, autofix's "pre"
+# step, handoff's "handoff" step) instead resolve the same-repository head
+# IN the REST query itself (`pulls?head=<owner>:<branch>`), wrapped in a
+# matching `# autopilot-scoped-pr-lookup:begin/:end` marker pair, the same
+# byte-equality pattern as SAME_REPO_FILTER_PATTERN above.
+SCOPED_PR_LOOKUP_PATTERN = re.compile(
+    r"# autopilot-scoped-pr-lookup:begin\n(.*?)"
+    r"# autopilot-scoped-pr-lookup:end\n",
+    re.S,
+)
+
+
+def scoped_pr_lookup_blocks():
+    """Extract the triage, autofix, and handoff copies of the shared
+    owner-qualified PR lookup. Each call site's `run:` script must contain
+    the marker pair exactly once; a missing or duplicated marker fails
+    loudly here rather than silently comparing the wrong (or no) text."""
+    triage_script = step("triage", "triage")["run"]
+    autofix_script = step("autofix", "pre")["run"]
+    handoff_script = step("handoff", "handoff")["run"]
+    blocks = {}
+    for name, script in (("triage", triage_script), ("autofix", autofix_script), ("handoff", handoff_script)):
+        found = SCOPED_PR_LOOKUP_PATTERN.findall(script)
+        assert len(found) == 1, (name, script)
+        blocks[name] = found[0]
+    return blocks["triage"], blocks["autofix"], blocks["handoff"]
+
+
 def make_shell_harness(testcase, **config):
     harness = ShellHarness({"prs": [trusted_pr()], "run": RUN} | config)
     testcase.addCleanup(harness.temp.cleanup)
@@ -134,6 +200,43 @@ def assert_queued(testcase, harness):
     testcase.assertEqual(len(edits), 1, harness.calls())
     testcase.assertIn("Handoff: queued", harness.summary.read_text())
     testcase.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+
+
+def assert_run_inadmissible_everywhere(testcase, **run_config):
+    """Round-12 P0: shared body for every "this run must not be admitted as
+    CI provenance" test (fork head_repository, mismatched head_branch, an
+    unconfirmable/blank field). Every site that consumes the triggering run
+    (triage's "triage" step, autofix's "pre" step, handoff) rejects it
+    gracefully: producers reach stale_rejected with no mutation calls and
+    no Codex invocation, and handoff exits nonzero without queuing."""
+    for job, step_id in (("triage", "triage"), ("autofix", "pre")):
+        with testcase.subTest(job=job, run_config=run_config):
+            harness = testcase.harness(**run_config)
+            assert_success(testcase, harness.run(job, step_id))
+            testcase.assertEqual(harness.outputs()["outcome"], "stale_rejected")
+            testcase.assertEqual(mutation_calls(harness), [])
+            testcase.assertFalse(any(c[0] == "codex" for c in harness.calls()))
+    harness = testcase.harness(**run_config)
+    result = testcase.handoff(harness)
+    testcase.assertNotEqual(result.returncode, 0)
+    testcase.assertEqual(mutation_calls(harness), [])
+    testcase.assertNotIn("Handoff: queued", harness.summary.read_text())
+
+
+def assert_run_provenance_fetch_failure_everywhere(testcase, **run_config):
+    """Round-12 P0: shared body for "the single-run REST fetch itself
+    fails outright" — a harder failure than a disagreeing field, so
+    producers abort non-zero rather than reaching a graceful stale_rejected
+    outcome; handoff likewise exits non-zero without queuing."""
+    for job, step_id in (("triage", "triage"), ("autofix", "pre")):
+        with testcase.subTest(job=job, run_config=run_config):
+            harness = testcase.harness(**run_config)
+            testcase.assertNotEqual(harness.run(job, step_id).returncode, 0)
+            testcase.assertEqual(mutation_calls(harness), [])
+    harness = testcase.harness(**run_config)
+    result = testcase.handoff(harness)
+    testcase.assertNotEqual(result.returncode, 0)
+    testcase.assertEqual(mutation_calls(harness), [])
 
 
 def assert_root_concurrency(testcase, workflow):
@@ -213,7 +316,23 @@ def decorate(pr):
 
 if name == "gh":
     if args[:2] == ["pr", "list"]:
-        print(json.dumps([decorate(pr) for pr in config.get("prs", [])]))
+        # Round-12 P1 regression fixture: real `gh pr list` defaults to
+        # `--limit 30` with no server-side owner qualification for
+        # `--head`, which is exactly the bug the scoped-pr-lookup marker
+        # replaced this call site with. Simulated here (cap + branch-name-
+        # only match, no owner scoping) purely so a hand-edit reverting a
+        # call site back to this endpoint is provable red by the P1
+        # collision regression test, not because production still calls
+        # this endpoint.
+        limit = 30
+        if "--limit" in args:
+            limit = int(args[args.index("--limit") + 1])
+        head_arg = args[args.index("--head") + 1] if "--head" in args else None
+        candidates = [decorate(pr) for pr in config.get("prs", [])]
+        if head_arg is not None:
+            queried_branch = head_arg.rsplit(":", 1)[-1]
+            candidates = [pr for pr in candidates if pr.get("headRefName") == queried_branch]
+        print(json.dumps(candidates[:limit]))
     elif args[:2] == ["pr", "view"]:
         views = config.get("views", config.get("prs", []))
         if not views:
@@ -250,6 +369,80 @@ if name == "gh":
                     print(json.dumps(page))
         elif "/labels/" in endpoint:
             print(json.dumps({"name": endpoint.rsplit("/", 1)[1]}))
+        elif "/pulls?head=" in endpoint:
+            # Round-12 P1's server-side owner-qualified PR lookup. Mimic
+            # the real REST `pulls?head=<owner>:<branch>&state=open`
+            # endpoint's OWN scoping (not just the production jq's
+            # after-the-fact filter) so a test with more-than-the-old-cap
+            # fork PRs actually proves the fix: a fork PR's owner never
+            # matches the queried owner, so it is excluded HERE, same as
+            # GitHub would exclude it server-side.
+            query = endpoint.split("head=", 1)[1]
+            head_value = query.split("&", 1)[0]
+            queried_owner, _, queried_branch = head_value.partition(":")
+            repo_full_name = os.environ.get("GITHUB_REPOSITORY", "")
+
+            def to_rest(pr):
+                pr = decorate(pr)
+                author = pr.get("author", {})
+                cross = pr.get("isCrossRepository", False)
+                head_repo = "attacker/fork" if cross else repo_full_name
+                return {
+                    "number": pr["number"],
+                    "title": pr.get("title", ""),
+                    "state": (pr.get("state", "OPEN") or "OPEN").lower(),
+                    "draft": pr.get("isDraft", False),
+                    "user": {
+                        "login": author.get("login", ""),
+                        "type": "Bot" if author.get("is_bot") else "User",
+                    },
+                    "base": {"ref": pr.get("baseRefName", "")},
+                    "head": {
+                        "ref": pr.get("headRefName", ""),
+                        "sha": pr.get("headRefOid", ""),
+                        "repo": {"full_name": head_repo},
+                    },
+                    "labels": pr.get("labels", []),
+                    "assignees": [
+                        {"login": a.get("login", ""), "type": "Bot" if a.get("is_bot") else "User"}
+                        for a in pr.get("assignees", [])
+                    ],
+                    "requested_reviewers": [
+                        r for r in pr.get("reviewRequests", []) if r.get("__typename") != "Team"
+                    ],
+                    "requested_teams": [
+                        r for r in pr.get("reviewRequests", []) if r.get("__typename") == "Team"
+                    ],
+                }
+
+            matches = []
+            for pr in config.get("prs", []):
+                rest = to_rest(pr)
+                rest_owner = rest["head"]["repo"]["full_name"].split("/", 1)[0]
+                if rest_owner == queried_owner and rest["head"]["ref"] == queried_branch \
+                   and rest["state"] == "open":
+                    matches.append(rest)
+            pages = [matches]
+            if "--slurp" in args:
+                print(json.dumps(pages))
+            else:
+                for page in pages:
+                    print(json.dumps(page))
+        elif endpoint.rsplit("/", 1)[-1].isdigit() and "/actions/runs/" in endpoint:
+            # Round-12 P0's fork-provenance admission fetch: a single run
+            # object's REST shape (`head_repository`, `head_branch`) is not
+            # exposed by `gh run view --json` at all, so this is a distinct
+            # endpoint from the run-list one below. Defaults are the
+            # legitimate same-repo/same-branch values, so an unrelated test
+            # (nearly every pre-existing one) admits trivially by
+            # construction; a test exercising the gate itself overrides
+            # `run["head_repository"]`/`run["head_branch"]` to disagree.
+            run_cfg = config.get("run", {})
+            default_repo = {"full_name": os.environ.get("GITHUB_REPOSITORY", "")}
+            print(json.dumps({
+                "head_repository": run_cfg.get("head_repository", default_repo),
+                "head_branch": run_cfg.get("head_branch", os.environ.get("BRANCH", "")),
+            }))
         else:
             default_runs = {"workflow_runs": [
                 {"workflow_id": 1, "run_number": 1, "run_attempt": 1, "conclusion": "success"},
@@ -259,10 +452,17 @@ if name == "gh":
             # (nearly every pre-existing test — this field predates
             # attempt-bound currency checking) defaults to attempt 1, the
             # same default `gh run view` uses above, so an unrelated test's
-            # currency stays trivially "current" by construction.
+            # currency stays trivially "current" by construction. Likewise
+            # head_repository/head_branch default to the legitimate
+            # same-repo/same-branch values (Round-12 P0/P1's inventory
+            # scoping) so only a test constructing a fork-origin entry on
+            # purpose ever disagrees.
             for page in pages:
                 for entry in page.get("workflow_runs", []):
                     entry.setdefault("run_attempt", 1)
+                    entry.setdefault("head_repository", {"full_name": os.environ.get("GITHUB_REPOSITORY", "")})
+                    entry.setdefault("head_branch", os.environ.get("BRANCH", ""))
+                    entry.setdefault("pull_requests", [])
             if "--slurp" in args:
                 print(json.dumps(pages))
             else:

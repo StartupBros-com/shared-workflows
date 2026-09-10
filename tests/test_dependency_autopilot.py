@@ -7,6 +7,7 @@ import unittest
 
 import autopilot_harness
 from autopilot_harness import (
+    BRANCH,
     NEW_SHA,
     OLD_SHA,
     ROOT,
@@ -71,11 +72,18 @@ class WorkflowTests(unittest.TestCase):
             for item in job["steps"]:
                 script = item.get("run", "").replace("\\\n", " ")
                 requests.extend(re.findall(
-                    r"gh pr (?:list|view)\b[^\n]*?--json ([^>\n]+)", script,
+                    r"gh pr view\b[^\n]*?--json ([^>\n]+)", script,
                 ))
-        self.assertEqual(len(requests), 7, requests)
+        # The scoped-pr-lookup marker replaced all three `gh pr list --json`
+        # call sites with a `gh api .../pulls` REST fetch mapped through
+        # jq; that mapping's `reviewRequests` field is asserted separately
+        # below rather than by this `--json` regex, since it is no longer
+        # a `--json` flag list.
+        self.assertEqual(len(requests), 4, requests)
         for fields in requests:
             self.assertIn("reviewRequests", fields.split(","), fields)
+        for block in autopilot_harness.scoped_pr_lookup_blocks():
+            self.assertIn("reviewRequests", block, block)
 
     def test_metadata_only_jobs_have_bounded_timeouts(self):
         # Triage and handoff do no long-running work; a platform default
@@ -201,6 +209,62 @@ class WorkflowTests(unittest.TestCase):
         triage_block, autofix_block, handoff_block = autopilot_harness.same_repo_filter_blocks()
         drifted_handoff_block = handoff_block.replace(
             "isCrossRepository == false", "isCrossRepository == true", 1)
+        self.assertNotEqual(triage_block, drifted_handoff_block)
+        self.assertNotEqual(autofix_block, drifted_handoff_block)
+        self.assertNotEqual(handoff_block, drifted_handoff_block)
+
+    def test_scoped_pr_lookup_is_locked_across_lookup_sites(self):
+        # Round-12 P1: every PR-lookup site (triage's "triage" step,
+        # autofix's "pre" step, handoff's "handoff" step) must resolve the
+        # same-repository head IN the REST query (owner-qualified
+        # `head=<owner>:<branch>`), not just filter client-side after a
+        # capped, unscoped list — and identically so. See
+        # autopilot_harness.scoped_pr_lookup_blocks for the extraction.
+        triage_block, autofix_block, handoff_block = autopilot_harness.scoped_pr_lookup_blocks()
+        # Non-trivial: guards against a marker pair wrapping an empty or
+        # near-empty span, which would make the equality assertion vacuous.
+        self.assertIn("pulls?head=", triage_block)
+        self.assertIn("state=open", triage_block)
+        self.assertIn("isCrossRepository", triage_block)
+        self.assertEqual(triage_block, autofix_block)
+        self.assertEqual(triage_block, handoff_block)
+
+    def test_scoped_pr_lookup_lockstep_guard_fails_on_drift(self):
+        # Proves the guard above is discriminating, not vacuously true: a
+        # one-sided edit to any one copy (here, handoff's) must make the
+        # byte-equality assertion fail, exactly as it would on a real
+        # future drift between the three call sites.
+        triage_block, autofix_block, handoff_block = autopilot_harness.scoped_pr_lookup_blocks()
+        drifted_handoff_block = handoff_block.replace(
+            "state=open&per_page=100", "state=all&per_page=100", 1)
+        self.assertNotEqual(triage_block, drifted_handoff_block)
+        self.assertNotEqual(autofix_block, drifted_handoff_block)
+        self.assertNotEqual(handoff_block, drifted_handoff_block)
+
+    def test_fork_provenance_gate_is_locked_across_call_sites(self):
+        # Round-12 P0: every site consuming the triggering run (triage's
+        # "triage" step, autofix's "pre" step, handoff's "handoff" step)
+        # must confirm the run's own head_repository and head_branch
+        # before treating it as CI provenance for the PR — and identically
+        # so. See autopilot_harness.fork_provenance_gate_blocks for the
+        # extraction.
+        triage_block, autofix_block, handoff_block = autopilot_harness.fork_provenance_gate_blocks()
+        # Non-trivial: guards against a marker pair wrapping an empty or
+        # near-empty span, which would make the equality assertion vacuous.
+        self.assertIn("head_repository", triage_block)
+        self.assertIn("head_branch", triage_block)
+        self.assertIn("run_same_repo_and_branch", triage_block)
+        self.assertEqual(triage_block, autofix_block)
+        self.assertEqual(triage_block, handoff_block)
+
+    def test_fork_provenance_gate_lockstep_guard_fails_on_drift(self):
+        # Proves the guard above is discriminating, not vacuously true: a
+        # one-sided edit to any one copy (here, handoff's) must make the
+        # byte-equality assertion fail, exactly as it would on a real
+        # future drift between the three call sites.
+        triage_block, autofix_block, handoff_block = autopilot_harness.fork_provenance_gate_blocks()
+        drifted_handoff_block = handoff_block.replace(
+            'run_same_repo_and_branch="false"', 'run_same_repo_and_branch="true"', 1)
         self.assertNotEqual(triage_block, drifted_handoff_block)
         self.assertNotEqual(autofix_block, drifted_handoff_block)
         self.assertNotEqual(handoff_block, drifted_handoff_block)
@@ -1137,6 +1201,114 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.mutation_calls(harness), [])
         self.assertNotIn("Handoff: queued", harness.summary.read_text())
 
+    def test_more_than_30_fork_collisions_still_resolve_the_legitimate_pr(self):
+        # Round-12 P1: round-11's fix filtered client-side on the output of
+        # `gh pr list`, which defaults to `--limit 30`; 30+ fork PRs on the
+        # predictable branch name could crowd the legitimate same-repo PR
+        # out of the result set before the same-repo filter ever saw it.
+        # The scoped-pr-lookup marker resolves the same-repository head IN
+        # the query (owner-qualified `head=<owner>:<branch>`), so the
+        # legitimate PR is found regardless of how many fork collisions
+        # exist or where it is ordered among them.
+        fork_prs = [
+            trusted_pr(
+                number=100 + i, isCrossRepository=True,
+                author={"login": "attacker", "is_bot": False},
+            )
+            for i in range(35)
+        ]
+        legit_pr = trusted_pr()
+        for job, step_id in (("triage", "triage"), ("autofix", "pre")):
+            with self.subTest(job=job):
+                harness = self.harness(prs=fork_prs + [legit_pr], views=[legit_pr])
+                self.success(harness.run(job, step_id))
+                outputs = harness.outputs()
+                self.assertNotEqual(outputs["outcome"], "stale_rejected", outputs)
+                self.assertEqual(outputs["number"], "21")
+
+        harness = self.harness(prs=fork_prs + [legit_pr], views=[trusted_pr()])
+        self.success(self.handoff(harness))
+        self.assert_queued(harness)
+
+    def test_fork_run_with_matching_head_sha_is_rejected_before_codex_or_credentials(self):
+        # Round-12 P0: a fork can push the IDENTICAL dependency-bump commit
+        # on a same-named branch, so its own pull_request CI run carries
+        # the SAME head SHA as the legitimate PR while head_repository
+        # differs. Head-SHA equality alone (the existing check) must not
+        # admit it — head_repository must be positively confirmed too, at
+        # every site that consumes the triggering run, before any Codex
+        # invocation or any credential-minting push. See
+        # autopilot_harness.assert_run_inadmissible_everywhere.
+        autopilot_harness.assert_run_inadmissible_everywhere(
+            self, run=RUN | {"head_repository": {"full_name": "attacker/fork"}},
+        )
+
+    def test_fork_run_with_mismatched_branch_is_rejected(self):
+        # Same admission gate, the head_branch half of the predicate: a
+        # run whose head_repository matches but whose head_branch does not
+        # is equally not usable as provenance for this PR.
+        autopilot_harness.assert_run_inadmissible_everywhere(
+            self, run=RUN | {"head_branch": "some-other-branch"},
+        )
+
+    def test_same_repo_run_with_matching_branch_is_still_admitted(self):
+        # Regression: the P0 admission gate must not change behavior for a
+        # genuinely legitimate same-repository, same-branch run.
+        for job, step_id in (("triage", "triage"), ("autofix", "pre")):
+            with self.subTest(job=job):
+                harness = self.harness()
+                self.success(harness.run(job, step_id))
+                self.assertNotEqual(harness.outputs()["outcome"], "stale_rejected")
+        harness = self.harness(views=[trusted_pr()])
+        self.success(self.handoff(harness))
+        self.assert_queued(harness)
+
+    def test_admission_fails_closed_when_run_repository_or_branch_cannot_be_confirmed(self):
+        # This is a privileged-action gate: uncertainty must block. An
+        # empty/blank repository or branch field (the run cannot be
+        # positively confirmed) must not admit by default.
+        for run in (RUN | {"head_repository": {}}, RUN | {"head_repository": {"full_name": ""}},
+                    RUN | {"head_branch": ""}):
+            with self.subTest(run=run):
+                autopilot_harness.assert_run_inadmissible_everywhere(self, run=run)
+
+    def test_admission_fails_closed_when_run_provenance_cannot_be_fetched(self):
+        # Same fail-closed contract when the single-run REST fetch itself
+        # fails outright (network error, rate limit, etc.), not merely
+        # returns a disagreeing repository/branch — a harder failure, so
+        # producers abort non-zero rather than reaching a graceful
+        # stale_rejected outcome.
+        autopilot_harness.assert_run_provenance_fetch_failure_everywhere(
+            self, fail_commands=["actions/runs/"],
+        )
+
+    def test_fork_run_cannot_appear_in_run_inventory_as_current(self):
+        # Round-12 P0 (inventory scoping): a fork's own pull_request CI run
+        # lands in the BASE repo's Actions history at the SAME head_sha as
+        # the legitimate PR (GitHub always posts pull_request runs to the
+        # base repo). Unscoped, a higher-numbered fork-origin SUCCESS entry
+        # for a sibling workflow could win group_by/max_by ahead of the
+        # real same-repo entry for that workflow, poisoning allgreen with
+        # an outcome the legitimate PR never produced.
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            run_pages=[{"workflow_runs": [
+                {"workflow_id": 1, "run_number": 1, "conclusion": "success"},
+                {"workflow_id": 2, "run_number": 1, "conclusion": "failure"},
+                {
+                    "workflow_id": 2, "run_number": 99, "conclusion": "success",
+                    "head_repository": {"full_name": "attacker/fork"},
+                    "head_branch": BRANCH,
+                },
+            ]}],
+        )
+        self.success(harness.run("triage", "triage", MODE="automerge"))
+        producer = harness.outputs()
+        self.assertEqual(producer["outcome"], "ci_unresolved")
+        self.success(self.handoff(harness, TRIAGE_OUTCOME=producer["outcome"]))
+        self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+        self.assertFalse(any("pro-review" in c for c in harness.calls()))
+
     def test_producers_fail_closed_on_unavailable_provenance(self):
         for job, step_id in (("autofix", "pre"), ("triage", "triage")):
             with self.subTest(job=job):
@@ -1299,7 +1471,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(any(c[:3] == ["gh", "label", "create"] and "--force" in c for c in harness.calls()))
 
     def test_terminal_api_label_and_comment_failures_are_visible(self):
-        for failed in ("gh run view", "gh pr list", "gh pr view", "gh pr edit", "gh pr comment"):
+        for failed in ("gh run view", "pulls?head=", "gh pr view", "gh pr edit", "gh pr comment"):
             with self.subTest(failed=failed):
                 harness = self.harness(fail_commands=[failed])
                 self.assertNotEqual(self.handoff(harness).returncode, 0)

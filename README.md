@@ -102,6 +102,52 @@ Use an existing approved runner through `runner` where required. The handoff use
 that same runner choice. A skipped caller on an unrelated main-branch run is
 expected, not evidence of a dependency-workflow outage.
 
+### Caller responsibility: reject cross-repository `workflow_run` events first
+
+This reusable workflow confirms, on every path that consumes the triggering
+run (`ci_run_id`), that the run's own `head_repository.full_name` matches
+`github.repository` and its `head_branch` matches the queried branch, before
+treating that run as CI provenance for a PR — a public fork can push the
+IDENTICAL dependency-bump commit on a same-named branch (e.g.
+`dependabot/npm/pkg-2.0.0`), giving its own `pull_request` run the SAME head
+SHA as the legitimate PR while `head_repository` differs, so head-SHA
+equality alone is not provenance. That check happens **inside** this
+workflow, after `secrets:` has already been passed to it by the caller's
+`workflow_run` job.
+
+**This reusable workflow cannot enforce anything upstream of its own
+invocation.** By the time its `if:` condition or first step runs, the
+caller's job has already evaluated, and any `secrets:` block it passed
+(`APP_PRIVATE_KEY`, `CODEX_AUTH`) has already been made available to that
+job's runner. A `workflow_run` event fires for runs from forks too — GitHub
+grants no repository-identity filtering on the trigger itself — so a caller
+whose `if:` condition only checks `event` and `head_branch` (as the example
+above does) invokes this reusable workflow, and exposes those secrets to its
+job environment, for a fork-originated run at the same predictable branch
+name. This reusable workflow's internal admission gate stops that run from
+being treated as provenance before any privileged action (Codex invocation,
+credential minting, merge, push) — but the secrets have already reached a
+job triggered by an event describing a fork's run before that gate runs.
+Defence in depth requires the caller to reject non-same-repository
+`workflow_run` events in its OWN `if:` condition, before this reusable
+workflow — and therefore before its `secrets:` — is ever invoked:
+
+```yaml
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (startsWith(github.event.workflow_run.head_branch, 'dependabot/') ||
+       startsWith(github.event.workflow_run.head_branch, 'renovate/'))
+```
+
+Add the `head_repository.full_name == github.repository` clause to every
+caller's `if:` condition. This reusable workflow's own admission gate stays
+as a second, independent layer — it fails closed (does not admit) whenever
+the run's repository or branch cannot be positively confirmed via the REST
+`actions/runs/{run_id}` endpoint, including when that fetch itself fails —
+but it cannot retroactively un-expose secrets a caller already handed to a
+job for a fork's event.
+
 ### Outcomes and ownership
 
 - **Safe green:** retains the existing `autopilot:ready` queue. It does not gain an

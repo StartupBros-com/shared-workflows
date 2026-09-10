@@ -96,8 +96,45 @@ jobs:
           prs_file="$RUNNER_TEMP/triage-prs.json"
           run_file="$RUNNER_TEMP/triage-run.json"
           runs_file="$RUNNER_TEMP/triage-runs.json"
-          gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open \
-            --json number,author,assignees,reviewRequests,baseRefName,headRefName,headRefOid,isCrossRepository,isDraft,labels,state,title > "$prs_file"
+          # Round-12 P1: `gh pr list --head` matches by branch name ONLY,
+          # with no server-side owner scoping and a default 30-item cap —
+          # so an attacker who opens MORE fork PRs on this predictable
+          # branch name than the cap can crowd the legitimate same-repo PR
+          # out of the result entirely; the same-repo filter below would
+          # then have nothing left to keep, reproducing the exact denial
+          # of service round 11 fixed. Resolve the same-repository head IN
+          # THE QUERY instead: the REST `pulls` list endpoint's
+          # `head=<owner>:<ref>` parameter is server-side owner-qualified,
+          # so a fork PR (whose head repository owner never matches) is
+          # excluded from the response ITSELF, not merely paginated past,
+          # however many of them exist. Map the REST shape to the same
+          # fields the rest of this script already expects, so the
+          # same-repo filter and every check below stay unchanged. Kept
+          # BYTE-IDENTICAL across all three call sites (triage, autofix,
+          # handoff) — tests/test_dependency_autopilot.py's
+          # test_scoped_pr_lookup_is_locked_across_lookup_sites extracts
+          # each copy verbatim and fails the suite the moment a future
+          # edit touches one site without the others.
+          # autopilot-scoped-pr-lookup:begin
+          gh api "repos/$GITHUB_REPOSITORY/pulls?head=${GITHUB_REPOSITORY%%/*}:$BRANCH&state=open&per_page=100" \
+            --paginate --slurp > "$RUNNER_TEMP/pr-lookup-raw.json"
+          jq --arg repo "$GITHUB_REPOSITORY" '
+            [ .[] | .[]
+              | {
+                  number, title,
+                  state: ((.state // "") | ascii_upcase),
+                  isDraft: (.draft // false),
+                  author: { login: (.user.login // ""), is_bot: ((.user.type // "") == "Bot") },
+                  baseRefName: (.base.ref // ""),
+                  headRefName: (.head.ref // ""),
+                  headRefOid: (.head.sha // ""),
+                  isCrossRepository: ((.head.repo.full_name // "") != $repo),
+                  labels: [ (.labels // [])[] | {name} ],
+                  assignees: [ (.assignees // [])[] | { login: (.login // ""), is_bot: ((.type // "") == "Bot") } ],
+                  reviewRequests: ((.requested_reviewers // []) + (.requested_teams // []))
+                }
+            ]' "$RUNNER_TEMP/pr-lookup-raw.json" > "$prs_file"
+          # autopilot-scoped-pr-lookup:end
           # A public caller repo lets anyone open an UPSTREAM PR from a FORK
           # branch matching a predictable dependency-bot branch name (e.g. a
           # Dependabot/Renovate branch). gh 2.97.0's `--head` flag does not
@@ -163,6 +200,37 @@ jobs:
           [ "$run_event" = "pull_request" ] || stop stale_rejected "run $RUN_ID is not pull_request provenance; skipping."
           [ -n "$run_sha" ] || stop stale_rejected "run $RUN_ID has no head SHA; skipping."
           [ "$run_sha" = "$pr_sha" ] || stop stale_rejected "run $RUN_ID was for $run_sha but PR #$num is now $pr_sha; skipping."
+
+          # Round-12 P0: a public fork can open a PR from a branch with the
+          # SAME NAME as this dependency-bot branch and push the exact same
+          # commit, giving its own `pull_request` CI run the SAME head SHA
+          # just checked above. Head-SHA equality is provenance-blind to
+          # WHICH repository produced that commit — `gh run view --json`
+          # exposes no field for the run's owning repository (see `gh run
+          # view --help`'s JSON FIELDS), so fetch the run's REST object
+          # directly for `head_repository.full_name` and `head_branch`.
+          # Fail CLOSED: an unconfirmable value is treated exactly like a
+          # mismatched one — this gates a privileged action (Codex log
+          # input, credential minting, merge), so uncertainty must never
+          # admit. Kept BYTE-IDENTICAL across all three call sites (triage,
+          # autofix, handoff) — tests/test_dependency_autopilot.py's
+          # test_fork_provenance_gate_is_locked_across_call_sites extracts
+          # each copy verbatim and fails the suite the moment a future edit
+          # touches one site without the others. Each site still applies
+          # its own admission action immediately below (stop vs. fail):
+          # triage/autofix and handoff use different control-flow helpers,
+          # so that one line cannot itself be shared.
+          # autopilot-fork-provenance-gate:begin
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > "$RUNNER_TEMP/run-provenance.json"
+          run_provenance_repo=$(jq -r '.head_repository.full_name // ""' "$RUNNER_TEMP/run-provenance.json")
+          run_provenance_branch=$(jq -r '.head_branch // ""' "$RUNNER_TEMP/run-provenance.json")
+          run_same_repo_and_branch="false"
+          if [ -n "$run_provenance_repo" ] && [ "$run_provenance_repo" = "$GITHUB_REPOSITORY" ] \
+             && [ -n "$run_provenance_branch" ] && [ "$run_provenance_branch" = "$BRANCH" ]; then
+            run_same_repo_and_branch="true"
+          fi
+          # autopilot-fork-provenance-gate:end
+          [ "$run_same_repo_and_branch" = "true" ] || stop stale_rejected "run $RUN_ID's head repository/branch is not confirmed as $GITHUB_REPOSITORY/$BRANCH (got '${run_provenance_repo:-unconfirmed}'/'${run_provenance_branch:-unconfirmed}'); a fork run cannot serve as CI provenance for this PR even at a matching head SHA; skipping."
 
           # Take only the latest run per workflow, across every page (a repo
           # can have more than 100 workflow runs at this head SHA). API
@@ -260,7 +328,28 @@ jobs:
             # extracts both copies verbatim and fails the suite the moment a
             # future edit touches one site without the other.
             # autopilot-freshness-predicate:begin
-            latest=$(jq '[ .[] | .workflow_runs[] ] | group_by(.workflow_id) | map(max_by(.run_number))' "$runs_file")
+            # Round-12 P0/P1 (inventory scoping): this listing queries by
+            # head_sha within THIS repo, so a fork's own `pull_request`
+            # CI run (GitHub always posts pull_request runs to the BASE
+            # repo's Actions history, fork or not) can appear here at the
+            # SAME head_sha as the legitimate PR. Unscoped, `max_by` can
+            # let a higher-numbered fork-origin run for ANY sibling
+            # workflow_id (not just this trigger's own) win the "latest"
+            # slot ahead of the real same-repo run for that workflow —
+            # poisoning allgreen with an outcome the legitimate PR never
+            # produced. Scope to same head_repository AND head_branch
+            # before picking the max per workflow_id, and bind the
+            # associated PR number too wherever the API exposes it: an
+            # EMPTY `pull_requests` array is not itself disqualifying
+            # (GitHub can omit it), so only a non-empty array that excludes
+            # this PR rejects the entry.
+            latest=$(jq --arg repo "$GITHUB_REPOSITORY" --arg branch "$BRANCH" --argjson num "$num" '
+              [ .[] | .workflow_runs[]
+                | select(.head_repository.full_name == $repo)
+                | select(.head_branch == $branch)
+                | select((.pull_requests // []) == [] or any(.pull_requests[]?; .number == $num))
+              ]
+              | group_by(.workflow_id) | map(max_by(.run_number))' "$runs_file")
             l_num=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | .run_number ] | first // empty' <<<"$latest")
             l_attempt=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | .run_attempt ] | first // empty' <<<"$latest")
             l_concl=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | (.conclusion // "") ] | first // empty' <<<"$latest")
@@ -540,8 +629,45 @@ jobs:
           prs_file="$RUNNER_TEMP/autofix-prs.json"
           run_file="$RUNNER_TEMP/autofix-run.json"
           runs_file="$RUNNER_TEMP/autofix-runs.json"
-          gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open \
-            --json number,author,assignees,reviewRequests,baseRefName,headRefName,headRefOid,isCrossRepository,isDraft,labels,state > "$prs_file"
+          # Round-12 P1: `gh pr list --head` matches by branch name ONLY,
+          # with no server-side owner scoping and a default 30-item cap —
+          # so an attacker who opens MORE fork PRs on this predictable
+          # branch name than the cap can crowd the legitimate same-repo PR
+          # out of the result entirely; the same-repo filter below would
+          # then have nothing left to keep, reproducing the exact denial
+          # of service round 11 fixed. Resolve the same-repository head IN
+          # THE QUERY instead: the REST `pulls` list endpoint's
+          # `head=<owner>:<ref>` parameter is server-side owner-qualified,
+          # so a fork PR (whose head repository owner never matches) is
+          # excluded from the response ITSELF, not merely paginated past,
+          # however many of them exist. Map the REST shape to the same
+          # fields the rest of this script already expects, so the
+          # same-repo filter and every check below stay unchanged. Kept
+          # BYTE-IDENTICAL across all three call sites (triage, autofix,
+          # handoff) — tests/test_dependency_autopilot.py's
+          # test_scoped_pr_lookup_is_locked_across_lookup_sites extracts
+          # each copy verbatim and fails the suite the moment a future
+          # edit touches one site without the others.
+          # autopilot-scoped-pr-lookup:begin
+          gh api "repos/$GITHUB_REPOSITORY/pulls?head=${GITHUB_REPOSITORY%%/*}:$BRANCH&state=open&per_page=100" \
+            --paginate --slurp > "$RUNNER_TEMP/pr-lookup-raw.json"
+          jq --arg repo "$GITHUB_REPOSITORY" '
+            [ .[] | .[]
+              | {
+                  number, title,
+                  state: ((.state // "") | ascii_upcase),
+                  isDraft: (.draft // false),
+                  author: { login: (.user.login // ""), is_bot: ((.user.type // "") == "Bot") },
+                  baseRefName: (.base.ref // ""),
+                  headRefName: (.head.ref // ""),
+                  headRefOid: (.head.sha // ""),
+                  isCrossRepository: ((.head.repo.full_name // "") != $repo),
+                  labels: [ (.labels // [])[] | {name} ],
+                  assignees: [ (.assignees // [])[] | { login: (.login // ""), is_bot: ((.type // "") == "Bot") } ],
+                  reviewRequests: ((.requested_reviewers // []) + (.requested_teams // []))
+                }
+            ]' "$RUNNER_TEMP/pr-lookup-raw.json" > "$prs_file"
+          # autopilot-scoped-pr-lookup:end
           # A public caller repo lets anyone open an UPSTREAM PR from a FORK
           # branch matching a predictable dependency-bot branch name (e.g. a
           # Dependabot/Renovate branch). gh 2.97.0's `--head` flag does not
@@ -614,6 +740,37 @@ jobs:
           [ -n "$run_sha" ] || stop stale_rejected "run $RUN_ID has no head SHA; skipping auto-fix."
           [ "$run_sha" = "$pr_sha" ] || stop stale_rejected "stale failure: run $RUN_ID was for $run_sha but PR #$num is now $pr_sha."
 
+          # Round-12 P0: a public fork can open a PR from a branch with the
+          # SAME NAME as this dependency-bot branch and push the exact same
+          # commit, giving its own `pull_request` CI run the SAME head SHA
+          # just checked above. Head-SHA equality is provenance-blind to
+          # WHICH repository produced that commit — `gh run view --json`
+          # exposes no field for the run's owning repository (see `gh run
+          # view --help`'s JSON FIELDS), so fetch the run's REST object
+          # directly for `head_repository.full_name` and `head_branch`.
+          # Fail CLOSED: an unconfirmable value is treated exactly like a
+          # mismatched one — this gates a privileged action (Codex log
+          # input, credential minting, merge), so uncertainty must never
+          # admit. Kept BYTE-IDENTICAL across all three call sites (triage,
+          # autofix, handoff) — tests/test_dependency_autopilot.py's
+          # test_fork_provenance_gate_is_locked_across_call_sites extracts
+          # each copy verbatim and fails the suite the moment a future edit
+          # touches one site without the others. Each site still applies
+          # its own admission action immediately below (stop vs. fail):
+          # triage/autofix and handoff use different control-flow helpers,
+          # so that one line cannot itself be shared.
+          # autopilot-fork-provenance-gate:begin
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > "$RUNNER_TEMP/run-provenance.json"
+          run_provenance_repo=$(jq -r '.head_repository.full_name // ""' "$RUNNER_TEMP/run-provenance.json")
+          run_provenance_branch=$(jq -r '.head_branch // ""' "$RUNNER_TEMP/run-provenance.json")
+          run_same_repo_and_branch="false"
+          if [ -n "$run_provenance_repo" ] && [ "$run_provenance_repo" = "$GITHUB_REPOSITORY" ] \
+             && [ -n "$run_provenance_branch" ] && [ "$run_provenance_branch" = "$BRANCH" ]; then
+            run_same_repo_and_branch="true"
+          fi
+          # autopilot-fork-provenance-gate:end
+          [ "$run_same_repo_and_branch" = "true" ] || stop stale_rejected "run $RUN_ID's head repository/branch is not confirmed as $GITHUB_REPOSITORY/$BRANCH (got '${run_provenance_repo:-unconfirmed}'/'${run_provenance_branch:-unconfirmed}'); a fork run cannot serve as CI provenance for this PR even at a matching head SHA; skipping auto-fix."
+
           # Trigger currency (see the triage job for the full rationale):
           # head-SHA equality above is not enough, and a run_number
           # mismatch against the (eventually consistent) run-list API alone
@@ -646,7 +803,28 @@ jobs:
             # extracts both copies verbatim and fails the suite the moment a
             # future edit touches one site without the other.
             # autopilot-freshness-predicate:begin
-            latest=$(jq '[ .[] | .workflow_runs[] ] | group_by(.workflow_id) | map(max_by(.run_number))' "$runs_file")
+            # Round-12 P0/P1 (inventory scoping): this listing queries by
+            # head_sha within THIS repo, so a fork's own `pull_request`
+            # CI run (GitHub always posts pull_request runs to the BASE
+            # repo's Actions history, fork or not) can appear here at the
+            # SAME head_sha as the legitimate PR. Unscoped, `max_by` can
+            # let a higher-numbered fork-origin run for ANY sibling
+            # workflow_id (not just this trigger's own) win the "latest"
+            # slot ahead of the real same-repo run for that workflow —
+            # poisoning allgreen with an outcome the legitimate PR never
+            # produced. Scope to same head_repository AND head_branch
+            # before picking the max per workflow_id, and bind the
+            # associated PR number too wherever the API exposes it: an
+            # EMPTY `pull_requests` array is not itself disqualifying
+            # (GitHub can omit it), so only a non-empty array that excludes
+            # this PR rejects the entry.
+            latest=$(jq --arg repo "$GITHUB_REPOSITORY" --arg branch "$BRANCH" --argjson num "$num" '
+              [ .[] | .workflow_runs[]
+                | select(.head_repository.full_name == $repo)
+                | select(.head_branch == $branch)
+                | select((.pull_requests // []) == [] or any(.pull_requests[]?; .number == $num))
+              ]
+              | group_by(.workflow_id) | map(max_by(.run_number))' "$runs_file")
             l_num=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | .run_number ] | first // empty' <<<"$latest")
             l_attempt=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | .run_attempt ] | first // empty' <<<"$latest")
             l_concl=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | (.conclusion // "") ] | first // empty' <<<"$latest")
@@ -1067,8 +1245,76 @@ jobs:
           [ -n "$run_url" ] || fail "triggering run URL is missing"
           [ "$run_sha" = "$trigger_sha" ] || fail "producer provenance does not match the triggering run head"
 
-          gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open \
-            --json number,author,assignees,reviewRequests,baseRefName,headRefName,headRefOid,isCrossRepository,isDraft,labels,state > "$prs_file"
+          # Round-12 P0: a public fork can open a PR from a branch with the
+          # SAME NAME as this dependency-bot branch and push the exact same
+          # commit, giving its own `pull_request` CI run the SAME head SHA
+          # just checked above. Head-SHA equality is provenance-blind to
+          # WHICH repository produced that commit — `gh run view --json`
+          # exposes no field for the run's owning repository (see `gh run
+          # view --help`'s JSON FIELDS), so fetch the run's REST object
+          # directly for `head_repository.full_name` and `head_branch`.
+          # Fail CLOSED: an unconfirmable value is treated exactly like a
+          # mismatched one — this gates a privileged action (Codex log
+          # input, credential minting, merge), so uncertainty must never
+          # admit. Kept BYTE-IDENTICAL across all three call sites (triage,
+          # autofix, handoff) — tests/test_dependency_autopilot.py's
+          # test_fork_provenance_gate_is_locked_across_call_sites extracts
+          # each copy verbatim and fails the suite the moment a future edit
+          # touches one site without the others. Each site still applies
+          # its own admission action immediately below (stop vs. fail):
+          # triage/autofix and handoff use different control-flow helpers,
+          # so that one line cannot itself be shared.
+          # autopilot-fork-provenance-gate:begin
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > "$RUNNER_TEMP/run-provenance.json"
+          run_provenance_repo=$(jq -r '.head_repository.full_name // ""' "$RUNNER_TEMP/run-provenance.json")
+          run_provenance_branch=$(jq -r '.head_branch // ""' "$RUNNER_TEMP/run-provenance.json")
+          run_same_repo_and_branch="false"
+          if [ -n "$run_provenance_repo" ] && [ "$run_provenance_repo" = "$GITHUB_REPOSITORY" ] \
+             && [ -n "$run_provenance_branch" ] && [ "$run_provenance_branch" = "$BRANCH" ]; then
+            run_same_repo_and_branch="true"
+          fi
+          # autopilot-fork-provenance-gate:end
+          [ "$run_same_repo_and_branch" = "true" ] || fail "run $RUN_ID's head repository/branch is not confirmed as $GITHUB_REPOSITORY/$BRANCH (got '${run_provenance_repo:-unconfirmed}'/'${run_provenance_branch:-unconfirmed}'); a fork run cannot serve as CI provenance for this PR even at a matching head SHA"
+
+          # Round-12 P1: `gh pr list --head` matches by branch name ONLY,
+          # with no server-side owner scoping and a default 30-item cap —
+          # so an attacker who opens MORE fork PRs on this predictable
+          # branch name than the cap can crowd the legitimate same-repo PR
+          # out of the result entirely; the same-repo filter below would
+          # then have nothing left to keep, reproducing the exact denial
+          # of service round 11 fixed. Resolve the same-repository head IN
+          # THE QUERY instead: the REST `pulls` list endpoint's
+          # `head=<owner>:<ref>` parameter is server-side owner-qualified,
+          # so a fork PR (whose head repository owner never matches) is
+          # excluded from the response ITSELF, not merely paginated past,
+          # however many of them exist. Map the REST shape to the same
+          # fields the rest of this script already expects, so the
+          # same-repo filter and every check below stay unchanged. Kept
+          # BYTE-IDENTICAL across all three call sites (triage, autofix,
+          # handoff) — tests/test_dependency_autopilot.py's
+          # test_scoped_pr_lookup_is_locked_across_lookup_sites extracts
+          # each copy verbatim and fails the suite the moment a future
+          # edit touches one site without the others.
+          # autopilot-scoped-pr-lookup:begin
+          gh api "repos/$GITHUB_REPOSITORY/pulls?head=${GITHUB_REPOSITORY%%/*}:$BRANCH&state=open&per_page=100" \
+            --paginate --slurp > "$RUNNER_TEMP/pr-lookup-raw.json"
+          jq --arg repo "$GITHUB_REPOSITORY" '
+            [ .[] | .[]
+              | {
+                  number, title,
+                  state: ((.state // "") | ascii_upcase),
+                  isDraft: (.draft // false),
+                  author: { login: (.user.login // ""), is_bot: ((.user.type // "") == "Bot") },
+                  baseRefName: (.base.ref // ""),
+                  headRefName: (.head.ref // ""),
+                  headRefOid: (.head.sha // ""),
+                  isCrossRepository: ((.head.repo.full_name // "") != $repo),
+                  labels: [ (.labels // [])[] | {name} ],
+                  assignees: [ (.assignees // [])[] | { login: (.login // ""), is_bot: ((.type // "") == "Bot") } ],
+                  reviewRequests: ((.requested_reviewers // []) + (.requested_teams // []))
+                }
+            ]' "$RUNNER_TEMP/pr-lookup-raw.json" > "$prs_file"
+          # autopilot-scoped-pr-lookup:end
           # A public caller repo lets anyone open an UPSTREAM PR from a FORK
           # branch matching a predictable dependency-bot branch name (e.g. a
           # Dependabot/Renovate branch). gh 2.97.0's `--head` flag does not
