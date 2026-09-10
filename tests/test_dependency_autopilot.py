@@ -1,316 +1,21 @@
 #!/usr/bin/env python3
 """Execute the reusable workflow's real shell blocks with fake external CLIs."""
 import json
-import os
 import re
-import shutil
 import subprocess
-import tempfile
 import unittest
-from pathlib import Path
 
-import yaml
-
-ROOT = Path(__file__).resolve().parents[1]
-WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/dependency-autopilot.yml").read_text())
-OLD_SHA = "a" * 40
-NEW_SHA = "b" * 40
-BRANCH = "dependabot/npm/pkg-2.0.0"
-RUN = {
-    "event": "pull_request",
-    "headSha": OLD_SHA,
-    "url": "https://github.com/StartupBros-com/example/actions/runs/9001",
-}
-
-
-def step(job, step_id):
-    return next(item for item in WORKFLOW["jobs"][job]["steps"] if item.get("id") == step_id)
-
-
-def trusted_pr(**changes):
-    pr = {
-        "number": 21,
-        "state": "OPEN",
-        "isDraft": False,
-        "author": {"login": "app/dependabot", "is_bot": True},
-        "baseRefName": "main",
-        "headRefName": BRANCH,
-        "isCrossRepository": False,
-        "headRefOid": OLD_SHA,
-        "title": "chore(deps): bump pkg from 1.0.0 to 2.0.0",
-        "labels": [],
-        "assignees": [],
-        "reviewRequests": [],
-    }
-    pr.update(changes)
-    return pr
-
-
-FAKE_CLI = r'''#!/usr/bin/env python3
-import copy
-import json
-import os
-import sys
-from pathlib import Path
-
-config = json.loads(Path(os.environ["FAKE_CONFIG"]).read_text())
-state_path = Path(os.environ["FAKE_STATE"])
-state = json.loads(state_path.read_text()) if state_path.exists() else {
-    "pr_view": 0, "added_labels": [], "removed_labels": [], "comments": [],
-}
-name = Path(sys.argv[0]).name
-args = sys.argv[1:]
-with Path(os.environ["FAKE_CALLS"]).open("a") as handle:
-    handle.write(json.dumps([name, *args]) + "\n")
-joined = " ".join([name, *args])
-if any(token in joined for token in config.get("fail_commands", [])):
-    sys.exit(42)
-
-
-def save():
-    state_path.write_text(json.dumps(state))
-
-
-def decorate(pr):
-    pr = copy.deepcopy(pr)
-    labels = [x for x in pr.get("labels", []) if x["name"] not in state["removed_labels"]]
-    for label in state["added_labels"]:
-        if not any(x["name"] == label for x in labels):
-            labels.append({"name": label})
-    pr["labels"] = labels
-    if "pushed_head" in state:
-        pr["headRefOid"] = state["pushed_head"]
-    return pr
-
-
-if name == "gh":
-    if args[:2] == ["pr", "list"]:
-        print(json.dumps([decorate(pr) for pr in config.get("prs", [])]))
-    elif args[:2] == ["pr", "view"]:
-        views = config.get("views", config.get("prs", []))
-        if not views:
-            sys.exit(44)
-        index = state["pr_view"]
-        state["pr_view"] += 1
-        save()
-        print(json.dumps(decorate(views[min(index, len(views) - 1)])))
-    elif args[:2] == ["run", "view"] and "--log-failed" in args:
-        print(config.get("failed_log", "tests failed"), end="")
-    elif args[:2] == ["run", "view"]:
-        print(json.dumps(config.get("run", {})))
-    elif args[0] == "api":
-        endpoint = args[1]
-        if "/comments" in endpoint:
-            pages = config.get("comment_pages", [[]]) + [state["comments"]]
-            if "--slurp" in args:
-                print(json.dumps(pages))
-            else:
-                for page in pages:
-                    print(json.dumps(page))
-        elif "/labels/" in endpoint:
-            print(json.dumps({"name": endpoint.rsplit("/", 1)[1]}))
-        else:
-            default_runs = {"workflow_runs": [
-                {"workflow_id": 1, "run_number": 1, "conclusion": "success"},
-            ]}
-            pages = config.get("run_pages", [config.get("runs", default_runs)])
-            if "--slurp" in args:
-                print(json.dumps(pages))
-            else:
-                for page in pages:
-                    print(json.dumps(page))
-    elif args[:2] == ["label", "create"]:
-        if config.get("label_exists", True) and "--force" not in args:
-            sys.exit(1)
-    elif args[:2] == ["pr", "edit"]:
-        for flag, target, opposite in (
-            ("--add-label", "added_labels", "removed_labels"),
-            ("--remove-label", "removed_labels", "added_labels"),
-        ):
-            if flag in args:
-                label = args[args.index(flag) + 1]
-                if label not in state[target]:
-                    state[target].append(label)
-                if label in state[opposite]:
-                    state[opposite].remove(label)
-        save()
-    elif args[:2] == ["pr", "comment"]:
-        state["comments"].append({
-            "body": args[args.index("--body") + 1],
-            "user": {"type": "Bot", "login": "github-actions[bot]"},
-        })
-        save()
-    elif args[:2] != ["pr", "merge"]:
-        sys.exit(47)
-elif name == "git":
-    if args[:1] == ["--literal-pathspecs"]:
-        args = args[1:]
-    if args[:2] == ["diff", "--name-only"]:
-        files = config.get("changed_files", [])
-        if "HEAD" in args:
-            files = files + config.get("staged_files", [])
-        if files:
-            print("\n".join(files))
-    elif args[0] == "ls-files":
-        files = config.get("untracked_files", [])
-        if "--modified" in args:
-            files = files + config.get("changed_files", [])
-        if files:
-            print("\n".join(files))
-    elif args[0] == "rev-parse":
-        print(config.get("remote_sha") if args[1].startswith("origin/") else config.get("pushed_sha"))
-    elif args[0] == "push":
-        state["pushed_head"] = config["pushed_sha"]
-        save()
-    elif args[0] not in {"fetch", "config", "add", "commit"}:
-        sys.exit(48)
-elif name == "codex":
-    sys.stdin.read()
-    if "-o" in args:
-        Path(args[args.index("-o") + 1]).write_text("test Codex result\n")
-    sys.exit(config.get("codex_rc", 0))
-'''
-
-
-class ShellHarness:
-    def __init__(self, config):
-        self.temp = tempfile.TemporaryDirectory(prefix="dependency-autopilot-test-")
-        self.root = Path(self.temp.name)
-        self.bin = self.root / "bin"
-        self.bin.mkdir()
-        self.config = self.root / "config.json"
-        self.config.write_text(json.dumps(config))
-        self.calls_path = self.root / "calls.jsonl"
-        self.output = self.root / "output.txt"
-        self.summary = self.root / "summary.md"
-        for name in ("gh", "git", "codex"):
-            path = self.bin / name
-            path.write_text(FAKE_CLI)
-            path.chmod(0o700)
-
-    def run(self, job, step_id, **env):
-        self.output.write_text("")
-        script = self.root / "step.sh"
-        script.write_text(step(job, step_id)["run"])
-        run_env = os.environ | {
-            "PATH": f"{self.bin}:{os.environ['PATH']}",
-            "HOME": str(self.root),
-            "RUNNER_TEMP": str(self.root),
-            "FAKE_CONFIG": str(self.config),
-            "FAKE_STATE": str(self.root / "state.json"),
-            "FAKE_CALLS": str(self.calls_path),
-            "GITHUB_OUTPUT": str(self.output),
-            "GITHUB_STEP_SUMMARY": str(self.summary),
-            "GITHUB_REPOSITORY": "StartupBros-com/example",
-            "GITHUB_SERVER_URL": "https://github.com",
-            "BRANCH": BRANCH,
-            "RUN_ID": "9001",
-            "GH_TOKEN": "test-token",
-            "MODE": "queue",
-            "CODEX_AUTH": "test-auth",
-            "APP_ID": "123",
-            "APP_PRIVATE_KEY": "test-key",
-        } | env
-        return subprocess.run(
-            ["bash", str(script)], cwd=self.root, env=run_env,
-            text=True, capture_output=True, check=False,
-        )
-
-    def calls(self):
-        return [json.loads(line) for line in self.calls_path.read_text().splitlines()] if self.calls_path.exists() else []
-
-    def outputs(self):
-        return dict(line.split("=", 1) for line in self.output.read_text().splitlines())
-
-
-class RealGitHarness:
-    def __init__(self, files):
-        self.temp = tempfile.TemporaryDirectory(prefix="dependency-autopilot-git-")
-        self.root = Path(self.temp.name)
-        self.repo = self.root / "fixture-repo"
-        self.runner_temp = self.root / "runner-temp"
-        self.runner_temp.mkdir()
-        self.output = self.runner_temp / "output.txt"
-        self.calls_path = self.runner_temp / "git-calls.jsonl"
-        self.real_git = shutil.which("git")
-        if not self.real_git:
-            raise RuntimeError("git is required for dependency-autopilot tests")
-        self.git("init", "-b", BRANCH, str(self.repo), cwd=self.root)
-        self.git("config", "user.name", "Dependency Autopilot Test")
-        self.git("config", "user.email", "dependency-autopilot-test@example.invalid")
-        for name, content in files.items():
-            self.write(name, content)
-        self.git("add", "--all")
-        self.git("commit", "-m", "test fixture")
-        self.trigger_sha = self.git("rev-parse", "HEAD").stdout.strip()
-        self.remote = self.root / "remote.git"
-        self.git("init", "--bare", str(self.remote), cwd=self.root)
-        self.git("remote", "add", "origin", str(self.remote))
-        self.git("push", "-u", "origin", BRANCH)
-
-        self.bin = self.root / "bin"
-        self.bin.mkdir()
-        wrapper = self.bin / "git"
-        wrapper.write_text(r'''#!/usr/bin/env python3
-import json
-import os
-import sys
-
-args = sys.argv[1:]
-with open(os.environ["REAL_GIT_CALLS"], "a") as handle:
-    handle.write(json.dumps(["git", *args]) + "\n")
-if args and args[0] == "push" and len(args) > 1 and args[1].startswith("https://"):
-    sys.exit(0)
-real_git = os.environ["REAL_GIT"]
-os.execv(real_git, [real_git, *args])
-''')
-        wrapper.chmod(0o700)
-
-    def cleanup(self):
-        self.temp.cleanup()
-
-    def write(self, name, content):
-        path = self.repo / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
-
-    def git(self, *args, cwd=None, check=True):
-        return subprocess.run(
-            [self.real_git, *args], cwd=cwd or self.repo,
-            text=True, capture_output=True, check=check,
-        )
-
-    def rename(self, old, new):
-        (self.repo / new).parent.mkdir(parents=True, exist_ok=True)
-        self.git("mv", old, new)
-
-    def run(self, job, step_id, **env):
-        self.output.write_text("")
-        script = self.runner_temp / "step.sh"
-        script.write_text(step(job, step_id)["run"])
-        run_env = os.environ | {
-            "PATH": f"{self.bin}:{os.environ['PATH']}",
-            "HOME": str(self.root),
-            "RUNNER_TEMP": str(self.runner_temp),
-            "REAL_GIT": self.real_git,
-            "REAL_GIT_CALLS": str(self.calls_path),
-            "GITHUB_OUTPUT": str(self.output),
-            "GITHUB_STEP_SUMMARY": str(self.runner_temp / "summary.md"),
-            "GITHUB_REPOSITORY": "StartupBros-com/example",
-            "BRANCH": BRANCH,
-            "TRIGGER_SHA": self.trigger_sha,
-            "PUSH_TOKEN": "test-push-token",
-        } | env
-        return subprocess.run(
-            ["bash", str(script)], cwd=self.repo, env=run_env,
-            text=True, capture_output=True, check=False,
-        )
-
-    def calls(self):
-        return [json.loads(line) for line in self.calls_path.read_text().splitlines()] if self.calls_path.exists() else []
-
-    def outputs(self):
-        return dict(line.split("=", 1) for line in self.output.read_text().splitlines())
+from autopilot_harness import (
+    NEW_SHA,
+    OLD_SHA,
+    ROOT,
+    RUN,
+    WORKFLOW,
+    RealGitHarness,
+    ShellHarness,
+    step,
+    trusted_pr,
+)
 
 
 class WorkflowTests(unittest.TestCase):
@@ -450,6 +155,94 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(harness.outputs()["outcome"], "review_held")
         self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
 
+    def test_success_skipped_and_neutral_share_the_reconciliation_path(self):
+        gate = WORKFLOW["jobs"]["triage"]["if"]
+        self.assertIn("success", gate)
+        self.assertIn("skipped", gate)
+        self.assertIn("neutral", gate)
+        handoff_script = step("handoff", "handoff")["run"]
+        self.assertIn('"success"|"skipped"|"neutral"', handoff_script)
+
+        cases = (
+            ("skipped", "chore(deps): bump pkg from 1.0.0 to 1.0.1", "green_safe"),
+            ("neutral", "chore(deps): bump pkg from 1.0.0 to 2.0.0", "review_held"),
+        )
+        for conclusion, title, expected in cases:
+            with self.subTest(conclusion=conclusion, expected=expected):
+                harness = self.harness(
+                    prs=[trusted_pr(title=title)],
+                    runs={"workflow_runs": [
+                        {"workflow_id": 1, "run_number": 1, "conclusion": "success"},
+                        {"workflow_id": 2, "run_number": 1, "conclusion": conclusion},
+                    ]},
+                )
+                self.success(harness.run("triage", "triage"))
+                producer = harness.outputs()
+                self.assertEqual(producer["outcome"], expected)
+                self.success(self.handoff(
+                    harness,
+                    CI_CONCLUSION=conclusion,
+                    TRIAGE_OUTCOME=producer["outcome"],
+                    TRIAGE_NUMBER=producer["number"],
+                    TRIAGE_TRIGGER_SHA=producer["trigger_sha"],
+                ))
+                if expected == "review_held":
+                    self.assert_queued(harness)
+                else:
+                    self.assertFalse(any("pro-review" in call for call in harness.calls()))
+
+    def test_only_skipped_or_neutral_inventory_is_not_green(self):
+        for conclusion in ("skipped", "neutral"):
+            with self.subTest(conclusion=conclusion):
+                harness = self.harness(
+                    prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+                    runs={"workflow_runs": [
+                        {"workflow_id": 1, "run_number": 1, "conclusion": conclusion},
+                    ]},
+                )
+                self.success(harness.run("triage", "triage", MODE="automerge"))
+                producer = harness.outputs()
+                self.assertEqual(producer["outcome"], "ci_unresolved")
+                self.success(self.handoff(
+                    harness,
+                    CI_CONCLUSION=conclusion,
+                    TRIAGE_OUTCOME=producer["outcome"],
+                    TRIAGE_NUMBER=producer["number"],
+                    TRIAGE_TRIGGER_SHA=producer["trigger_sha"],
+                ))
+                self.assertFalse(any(call[:3] == ["gh", "pr", "merge"] for call in harness.calls()))
+                self.assertFalse(any("pro-review" in call for call in harness.calls()))
+
+    def test_harmless_late_label_change_does_not_abandon_triage(self):
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            views=[trusted_pr(
+                title="chore(deps): bump pkg from 1.0.0 to 1.0.1",
+                labels=[{"name": "release-note:skip"}],
+            )],
+        )
+        self.success(harness.run("triage", "triage"))
+        self.assertEqual(harness.outputs()["outcome"], "green_safe")
+        self.assertTrue(any("autopilot:ready" in call for call in harness.calls()))
+
+    def test_late_title_or_autofix_hold_is_reclassified_from_fresh_metadata(self):
+        cases = (
+            {"title": "chore(deps): bump pkg from 1.0.0 to 2.0.0"},
+            {
+                "title": "chore(deps): bump pkg from 1.0.0 to 1.0.1",
+                "labels": [{"name": "autopilot:autofixed"}],
+            },
+        )
+        for changes in cases:
+            with self.subTest(changes=changes):
+                harness = self.harness(
+                    prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+                    views=[trusted_pr(**changes)],
+                )
+                self.success(harness.run("triage", "triage", MODE="automerge"))
+                self.assertEqual(harness.outputs()["outcome"], "review_held")
+                self.assertFalse(any(call[:3] == ["gh", "pr", "merge"] for call in harness.calls()))
+
     def test_non_green_sibling_ci_is_deferred_even_under_automerge(self):
         for conclusion in ("failure", None):
             with self.subTest(conclusion=conclusion):
@@ -524,12 +317,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
 
     def test_triage_stops_if_ownership_or_head_changes_before_mutation(self):
-        for changes in ({"headRefOid": NEW_SHA}, {"labels": [{"name": "claimed"}]},
-                        {"assignees": [{"login": "operator"}]}):
-            harness = self.harness(views=[trusted_pr(**changes)])
-            self.success(harness.run("triage", "triage", MODE="automerge"))
-            self.assertEqual(harness.outputs()["outcome"], "stale_rejected")
-            self.assertEqual(self.mutation_calls(harness), [])
+        cases = (
+            ({"headRefOid": NEW_SHA}, "stale_rejected"),
+            ({"labels": [{"name": "claimed"}]}, "existing_owner"),
+            ({"labels": [{"name": "skip-pro-review"}]}, "existing_owner"),
+            ({"assignees": [{"login": "operator"}]}, "existing_owner"),
+            ({"reviewRequests": [{"__typename": "Team", "slug": "maintainers"}]}, "existing_owner"),
+        )
+        for changes, expected in cases:
+            with self.subTest(changes=changes):
+                harness = self.harness(views=[trusted_pr(**changes)])
+                self.success(harness.run("triage", "triage", MODE="automerge"))
+                self.assertEqual(harness.outputs()["outcome"], expected)
+                self.assertEqual(self.mutation_calls(harness), [])
 
     def test_red_producer_to_handoff_uses_real_outcome_blocks(self):
         for codex_rc in (0, 17):
@@ -564,8 +364,8 @@ class WorkflowTests(unittest.TestCase):
                 self.success(self.red_handoff(harness, "no_changes", CI_CONCLUSION=conclusion))
                 self.assert_queued(harness)
 
-    def test_non_failure_like_ci_conclusions_have_no_handoff_path(self):
-        for conclusion in ("cancelled", "neutral", "skipped", "an_unforeseen_future_conclusion"):
+    def test_cancelled_and_unknown_ci_conclusions_have_no_handoff_path(self):
+        for conclusion in ("cancelled", "an_unforeseen_future_conclusion"):
             with self.subTest(conclusion=conclusion):
                 harness = self.harness()
                 result = self.handoff(harness, CI_CONCLUSION=conclusion,

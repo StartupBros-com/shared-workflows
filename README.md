@@ -8,17 +8,18 @@ A shared dependency workflow, called after a repository's PR CI finishes:
 
 ```text
 Dependabot / Renovate PR -> CI completes
-  green -> classify
-    sibling CI unresolved -> keep the conservative hold; defer handoff
-    all green + safe -> existing ready queue (or merge when caller selects automerge)
-    all green + held -> existing pro-review daemon
+  success / skipped / neutral -> reconcile the latest watched-workflow inventory
+    no genuine success, or sibling CI unresolved -> keep the conservative hold;
+      defer handoff
+    all accepted + at least one success + safe -> existing ready queue (or merge
+      when caller selects automerge)
+    all accepted + at least one success + held -> existing pro-review daemon
   red (failure, timed_out, action_required, startup_failure) -> bounded
       application-code repair
     pushed -> hold for review, rerun CI, hand off the new head
     no changes / unavailable credentials / failed execution -> hand off the
       unchanged PR only if its identity and source CI can be revalidated
-  cancelled / neutral / skipped / anything else -> no handoff path; not
-      unresolved red work
+  cancelled / anything else -> no handoff path; does not restart work
 ```
 
 The workflow serializes all producer and handoff jobs for a caller's PR branch.
@@ -39,8 +40,9 @@ that pin is deliberately updated to a reviewed commit.
 A caller filters to dependency-bot PR events and passes the original CI run.
 Its `workflows:` list **must name every PR-triggered CI workflow**, not only the
 primary workflow: unresolved sibling CI is deliberately deferred until that
-sibling's watched completion event arrives, so an incomplete list cannot promise
-a failure callback or safe repair-before-review ordering.
+sibling's watched completion event arrives. Success, skipped, and neutral watched
+completions all run reconciliation; failure-like completions run repair. An
+incomplete list cannot promise a callback or safe repair-before-review ordering.
 
 ```yaml
 name: Dependency Autopilot
