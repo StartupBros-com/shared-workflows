@@ -1,28 +1,10 @@
 name: Dependency Autopilot (reusable)
 
-# Centralized dependency loop, called by a thin stub in each repo.
-#
-#   Dependabot opens a PR  ->  repo CI runs  ->  this workflow (via the stub's
-#   `workflow_run` trigger):
-#     * CI green -> TRIAGE: classify risk + label. In `mode: queue` (default) it
-#       labels `autopilot:ready` (safe, you click merge) or `autopilot:review`
-#       (needs a human). In `mode: automerge` it merges the safe ones.
-#     * CI red   -> Codex reads the failed logs and pushes the minimal code fix,
-#       which re-triggers CI. (Needs CODEX_AUTH + a push token; skips cleanly
-#       where those aren't available, e.g. public repos until the GitHub App.)
-#
-# WHY queue is the default: auto-merge is only as safe as the CI behind it. Until
-# a repo's CI is a *required* gate with real tests, we prepare + label instead of
-# merging. Flip a repo to `mode: automerge` once its CI is trustworthy.
-#
-# SECURITY (callable from PUBLIC repos, so the guards are load-bearing):
-#   * Acts only on a trusted dep-bot author: dependabot[bot] (gh: 'app/dependabot') OR the
-#     org's own self-hosted Renovate app 'app/startupbros-autopilot'; AND isCrossRepository
-#     == false. Both are non-forgeable app identities, so a spoofed `dependabot/*` or
-#     `renovate/*` fork branch is rejected by the same-repo guard.
-#   * Auto-fix checks out with persist-credentials:false, runs Codex network-
-#     sandboxed, and refuses to commit lockfile/manifest/workflow edits.
-#   * No long-lived secret is needed for triage/merge (default GITHUB_TOKEN).
+# Centralized dependency loop, called by a thin workflow_run stub in each repo.
+# Green PRs are classified and queued as before. Review-tier green PRs and
+# unresolved red PRs are handed to the existing pro-review daemon only after
+# their producer finishes and the PR identity, provenance, head, and ownership
+# are revalidated.
 
 on:
   workflow_call:
@@ -36,7 +18,7 @@ on:
         required: true
         type: string
       ci_run_id:
-        description: "Triggering CI run id (to read failed logs on the fix path)"
+        description: "Triggering pull_request CI run id"
         required: true
         type: string
       ecosystem:
@@ -51,11 +33,8 @@ on:
         type: string
       runner:
         description: >-
-          runs-on label for both jobs. Public callers keep the default
-          (GitHub-hosted is free and unmetered for public repos). Private
-          callers pass a Blacksmith label (e.g. blacksmith-2vcpu-ubuntu-2404)
-          so the loop survives the org's included-minutes quota exhausting
-          (2026-07 outage: every private caller was dead for a week).
+          runs-on label for producer jobs. Public callers keep the default;
+          private callers may pass their approved self-hosted runner label.
         required: false
         default: "ubuntu-latest"
         type: string
@@ -67,79 +46,108 @@ on:
       CODEX_AUTH:
         required: false
 
+# A single concurrency group serializes triage, autofix, and terminal handoff
+# runs for the same caller PR branch so they do not race one another. This is
+# not a FIFO queue of every event: GitHub keeps at most one running and one
+# pending run per group, and a newer pending run replaces an older pending
+# one rather than queuing behind it.
+concurrency:
+  group: dependency-autopilot-${{ github.repository }}-${{ inputs.pr_branch }}
+  cancel-in-progress: false
+
 jobs:
   # ---------------- TRIAGE (CI green): classify risk, label, optionally merge ----------------
   triage:
     if: ${{ inputs.ci_conclusion == 'success' }}
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 8
+    outputs:
+      outcome: ${{ steps.triage.outputs.outcome }}
+      number: ${{ steps.triage.outputs.number }}
+      trigger_sha: ${{ steps.triage.outputs.trigger_sha }}
     permissions:
-      contents: write          # merge (automerge mode only)
-      pull-requests: write      # labels
-      actions: read             # read sibling CI runs
+      contents: write
+      pull-requests: write
+      actions: read
     steps:
       - name: Classify a genuine dep-bot PR and label (merge only in automerge mode)
+        id: triage
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ inputs.pr_branch }}
           MODE: ${{ inputs.mode }}
+          RUN_ID: ${{ inputs.ci_run_id }}
         run: |
           set -euo pipefail
+          echo "outcome=failed_execution" >> "$GITHUB_OUTPUT"
+          stop() {
+            echo "::notice::$2"
+            echo "outcome=$1" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          prs_file="$RUNNER_TEMP/triage-prs.json"
+          run_file="$RUNNER_TEMP/triage-run.json"
+          runs_file="$RUNNER_TEMP/triage-runs.json"
           gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open \
-            --json number,author,isCrossRepository,title,labels > /tmp/prs.json
-          num=$(jq -r '.[0].number // empty' /tmp/prs.json)
-          [ -n "$num" ] || { echo "No open PR for $BRANCH"; exit 0; }
-          author=$(jq -r '.[0].author.login' /tmp/prs.json)
-          is_bot=$(jq -r '.[0].author.is_bot' /tmp/prs.json)
-          xrepo=$(jq -r '.[0].isCrossRepository' /tmp/prs.json)
-          title=$(jq -r '.[0].title' /tmp/prs.json)
-          echo "PR #$num by '$author' (bot=$is_bot cross-repo=$xrepo): $title"
+            --json number,author,assignees,baseRefName,headRefName,headRefOid,isCrossRepository,isDraft,labels,state,title > "$prs_file"
+          count=$(jq 'length' "$prs_file")
+          [ "$count" = "1" ] || stop stale_rejected "expected one open PR for '$BRANCH', found $count; skipping."
 
-          # --- HARD GUARDS (critical on public repos) ---
-          # Assert a genuine App/Bot actor (is_bot) AND an allowlisted login. is_bot is essential:
-          # normalizing away 'app/' collapses the App 'app/startupbros-autopilot' and a User named
-          # 'startupbros-autopilot' to the same string, so a bare-login match alone would trust a
-          # colliding User. The allowlist restricts to our two trusted dep bots (Dependabot, and
-          # the org's OWN self-hosted Renovate app). The same-repo guard blocks fork spoofing.
-          # gh returns bot logins as 'app/<name>' on runners; normalize the app/ and [bot] forms.
+          num=$(jq -r '.[0].number' "$prs_file")
+          author=$(jq -r '.[0].author.login // ""' "$prs_file")
+          is_bot=$(jq -r '.[0].author.is_bot // false' "$prs_file")
+          xrepo=$(jq -r '.[0].isCrossRepository' "$prs_file")
+          base=$(jq -r '.[0].baseRefName // ""' "$prs_file")
+          head_branch=$(jq -r '.[0].headRefName // ""' "$prs_file")
+          pr_sha=$(jq -r '.[0].headRefOid // ""' "$prs_file")
+          title=$(jq -r '.[0].title' "$prs_file")
           norm="${author#app/}"; norm="${norm%\[bot\]}"
-          [ "$is_bot" = "true" ] || { echo "::notice::author '$author' is not a bot/app, skip"; exit 0; }
-          case "$norm" in dependabot|startupbros-autopilot) : ;; *) { echo "::notice::author '$author' not a trusted dep bot, skip"; exit 0; } ;; esac
-          [ "$xrepo" = "false" ] || { echo "::notice::cross-repository PR, skip"; exit 0; }
+          { echo "number=$num"; echo "trigger_sha=$pr_sha"; } >> "$GITHUB_OUTPUT"
 
-          # --- are ALL pull_request CI runs on this commit green? (actions:read) ---
+          [ "$is_bot" = "true" ] || stop stale_rejected "author '$author' is not a bot/app; skipping."
+          case "$norm" in dependabot|startupbros-autopilot) : ;; *) stop stale_rejected "author '$author' is not a trusted dependency bot; skipping." ;; esac
+          [ "$xrepo" = "false" ] || stop stale_rejected "cross-repository PR; skipping."
+          [ "$base" = "main" ] || stop stale_rejected "base must be main, got '$base'; skipping."
+          [ "$head_branch" = "$BRANCH" ] || stop stale_rejected "PR head branch no longer matches the trigger; skipping."
+          [ -n "$pr_sha" ] || stop stale_rejected "PR head SHA is missing; skipping."
+          [ "$(jq -r '.[0].isDraft // false' "$prs_file")" = "false" ] || stop existing_owner "PR #$num is a draft; leaving it to its author."
+
+          for owner_label in pro-review skip-pro-review claimed loop-run; do
+            if jq -e --arg label "$owner_label" 'any(.[0].labels[]?; .name == $label)' "$prs_file" >/dev/null; then
+              stop existing_owner "PR #$num already carries '$owner_label'; leaving it to its current owner."
+            fi
+          done
+          human_assignees=$(jq '[.[0].assignees[]? | select((.is_bot // false) != true)] | length' "$prs_file")
+          [ "$human_assignees" = "0" ] || stop existing_owner "PR #$num has a human assignee; leaving it to that owner."
+
+          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json event,headSha,url > "$run_file"
+          run_event=$(jq -r '.event // ""' "$run_file")
+          run_sha=$(jq -r '.headSha // ""' "$run_file")
+          [ "$run_event" = "pull_request" ] || stop stale_rejected "run $RUN_ID is not pull_request provenance; skipping."
+          [ -n "$run_sha" ] || stop stale_rejected "run $RUN_ID has no head SHA; skipping."
+          [ "$run_sha" = "$pr_sha" ] || stop stale_rejected "run $RUN_ID was for $run_sha but PR #$num is now $pr_sha; skipping."
+
+          # Take only the latest run per workflow, across every page (a repo
+          # can have more than 100 workflow runs at this head SHA). API
+          # failure is not green, and an empty run inventory is not green
+          # either — it means CI evidence is missing, not that it passed.
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$pr_sha&event=pull_request&per_page=100" \
+            --paginate --slurp > "$runs_file"
+          latest=$(jq '[ .[] | .workflow_runs[] ] | group_by(.workflow_id) | map(max_by(.run_number))' "$runs_file")
+          total=$(jq 'length' <<<"$latest")
+          bad=$(jq '[ .[] | (.conclusion // "pending") ]
+                    | map(select(. != "success" and . != "skipped" and . != "neutral")) | length' <<<"$latest")
           allgreen=1
-          sha=$(gh pr view "$num" --repo "$GITHUB_REPOSITORY" --json headRefOid -q '.headRefOid' 2>/dev/null || echo "")
-          if [ -n "$sha" ]; then
-            # Take only the LATEST run per workflow (a re-run leaves a stale older
-            # run on the same SHA; counting it would wrongly mark green PRs as not-green).
-            bad=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$sha&event=pull_request&per_page=100" \
-                    -q '[ .workflow_runs | group_by(.workflow_id) | .[] | max_by(.run_number)
-                          | (.conclusion // "pending") ]
-                        | map(select(. != "success" and . != "skipped" and . != "neutral")) | length' \
-                    2>/dev/null || echo 0)
-            [ "${bad:-0}" -gt 0 ] && allgreen=0
-          fi
+          [ "$bad" -gt 0 ] && allgreen=0
+          [ "$total" -eq 0 ] && allgreen=0
 
-          # --- classify risk tier ---
+          # Keep this classifier in lockstep with tests/classify-tier.test.sh.
           tier="review"; reason="unclassified"
-          # NB: dependabot names GHA branches dependabot/github_actions/... (underscore),
-          # not github-actions — match both or GHA bumps misclassify as review.
           if [[ "$BRANCH" == *"minor-and-patch"* || "$BRANCH" == *"github-actions"* || "$BRANCH" == *"github_actions"* ]]; then
             tier="safe"; reason="grouped minor/patch"
-          # Renovate vulnerability PRs are titled "Update dependency X@<range> to
-          # >=Y [SECURITY]" — a RANGE, not the "from A.B.C to D.E.F" shape below.
-          # They therefore never matched and landed on the generic
-          # "unclassified" reason, which reads like a parser gap rather than a
-          # deliberate hold. Classify them explicitly: still review (a security
-          # bump crossing a major line is exactly what a human should look at),
-          # but with an honest reason and the versions named.
           elif [[ "$title" == *"[SECURITY]"* ]]; then
             tier="review"
-            # Anchor at the dependency's own version (right after @). A greedy
-            # match reads the RANGE'S UPPER BOUND as the "from" major: for
-            # "next@>=15.6.0-canary.0 <16.1.5 to >=16.3.0" that yields 16->16
-            # and hides a real major-line jump. Caught by a fixture built from
-            # the live titles.
             if [[ "$title" =~ @[^0-9]*([0-9]+)\.[0-9]+.*\ to\ \>?=?v?([0-9]+) ]]; then
               sfM="${BASH_REMATCH[1]}"; stM="${BASH_REMATCH[2]}"
               if [ "$sfM" != "$stM" ]; then
@@ -161,46 +169,59 @@ jobs:
             fi
           fi
           if [ "$allgreen" != "1" ]; then tier="review"; reason="${reason}; not all CI green"; fi
-          # AI-authored auto-fixes must ALWAYS get a human merge — never automerge them,
-          # even if the bump itself looks safe. (The autofix path stamps this label.)
-          if jq -e '(.[0].labels // []) | map(.name) | index("autopilot:autofixed")' /tmp/prs.json >/dev/null 2>&1; then
+          if jq -e 'any(.[0].labels[]?; .name == "autopilot:autofixed")' "$prs_file" >/dev/null; then
             tier="review"; reason="contains AI-authored auto-fix — human review required"
           fi
           echo "tier=$tier reason=$reason allgreen=$allgreen mode=$MODE"
 
-          # --- ensure labels exist (idempotent) ---
-          gh label create "autopilot:ready"  --repo "$GITHUB_REPOSITORY" --color 0e8a16 --description "Autopilot: CI green + low risk — safe to merge" 2>/dev/null || true
-          gh label create "autopilot:review" --repo "$GITHUB_REPOSITORY" --color fbca04 --description "Autopilot: needs a human look before merge" 2>/dev/null || true
+          fresh_file="$RUNNER_TEMP/triage-fresh.json"
+          gh pr view "$num" --repo "$GITHUB_REPOSITORY" \
+            --json number,author,assignees,baseRefName,headRefName,headRefOid,isCrossRepository,isDraft,labels,state,title > "$fresh_file"
+          jq -e --slurpfile fresh "$fresh_file" '.[0] == $fresh[0]' "$prs_file" >/dev/null \
+            || stop stale_rejected "PR #$num changed during classification; leaving it for the current owner or next run."
+
+          gh label create "autopilot:ready" --repo "$GITHUB_REPOSITORY" \
+            --color 0e8a16 --description "Autopilot: CI green + low risk — safe to merge" \
+            || gh api "repos/$GITHUB_REPOSITORY/labels/autopilot:ready" --silent
+          gh label create "autopilot:review" --repo "$GITHUB_REPOSITORY" \
+            --color fbca04 --description "Autopilot: held for review before merge" \
+            || gh api "repos/$GITHUB_REPOSITORY/labels/autopilot:review" --silent
 
           if [ "$tier" = "safe" ]; then
-            gh pr edit "$num" --repo "$GITHUB_REPOSITORY" --add-label "autopilot:ready" --remove-label "autopilot:review" 2>/dev/null || true
+            gh pr edit "$num" --repo "$GITHUB_REPOSITORY" --add-label "autopilot:ready" --remove-label "autopilot:review"
             if [ "$MODE" = "automerge" ]; then
-              echo "mode=automerge + safe -> merging."
-              gh pr merge "$num" --repo "$GITHUB_REPOSITORY" --squash
+              gh pr merge "$num" --repo "$GITHUB_REPOSITORY" --squash --match-head-commit "$pr_sha"
             else
-              echo "::notice::queue mode — #$num is READY ($reason). Labeled autopilot:ready; merge when you're comfortable."
+              echo "::notice::queue mode — #$num is ready ($reason)."
             fi
+            outcome="green_safe"
           else
-            gh pr edit "$num" --repo "$GITHUB_REPOSITORY" --add-label "autopilot:review" --remove-label "autopilot:ready" 2>/dev/null || true
-            echo "::notice::#$num needs review ($reason). Labeled autopilot:review."
+            gh pr edit "$num" --repo "$GITHUB_REPOSITORY" --add-label "autopilot:review" --remove-label "autopilot:ready"
+            echo "::notice::#$num is held for review ($reason)."
+            outcome="review_held"
           fi
+          { echo "tier=$tier"; echo "outcome=$outcome"; } >> "$GITHUB_OUTPUT"
 
-  # ---------------- AUTO-FIX (CI red) — needs Codex creds + push token ----------------
+  # ---------------- AUTO-FIX (CI red): bounded application-code repair ----------------
+  # Failure-like conclusions kept in lockstep with the handoff's shell case
+  # below (tests/test_dependency_autopilot.py asserts both stay in sync).
+  # cancelled, neutral, and skipped are deliberately excluded: they are not
+  # unresolved red work.
   autofix:
-    if: ${{ inputs.ci_conclusion == 'failure' }}
+    if: ${{ contains(fromJSON('["failure","timed_out","action_required","startup_failure"]'), inputs.ci_conclusion) }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
-    # One fix attempt per PR branch at a time — a second CI failure won't race a
-    # fix already in flight (don't cancel: let the running fix finish + push).
-    concurrency:
-      group: autopilot-autofix-${{ github.repository }}-${{ inputs.pr_branch }}
-      cancel-in-progress: false
+    outputs:
+      outcome: ${{ steps.result.outputs.outcome }}
+      number: ${{ steps.pre.outputs.number }}
+      trigger_sha: ${{ steps.pre.outputs.trigger_sha }}
+      pushed_sha: ${{ steps.push.outputs.pushed_sha }}
     permissions:
       contents: read
       pull-requests: read
       actions: read
     steps:
-      - name: Preconditions — creds, validate the PR, freshness
+      - name: Validate PR identity, ownership, provenance, and credentials
         id: pre
         env:
           GH_TOKEN: ${{ github.token }}
@@ -211,38 +232,60 @@ jobs:
           RUN_ID: ${{ inputs.ci_run_id }}
         run: |
           set -euo pipefail
-          skip() { echo "::notice::$1"; echo "ok=0" >> "$GITHUB_OUTPUT"; exit 0; }
-          # Need Codex creds + App creds, else this repo can't auto-fix (e.g. public repo).
-          if [ -z "${CODEX_AUTH:-}" ] || [ -z "${APP_ID:-}" ] || [ -z "${APP_PRIVATE_KEY:-}" ]; then
-            skip "Auto-fix needs CODEX_AUTH + GitHub App creds — not available here; skipping (auto-merge/queue still active)."
-          fi
+          echo "outcome=failed_execution" >> "$GITHUB_OUTPUT"
+          stop() {
+            echo "::notice::$2"
+            echo "outcome=$1" >> "$GITHUB_OUTPUT"
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          prs_file="$RUNNER_TEMP/autofix-prs.json"
+          run_file="$RUNNER_TEMP/autofix-run.json"
           gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open \
-            --json number,author,baseRefName,isCrossRepository,headRefOid > /tmp/pr.json
-          num=$(jq -r '.[0].number // empty' /tmp/pr.json)
-          [ -n "$num" ] || skip "no open PR for $BRANCH (closed/merged); skipping."
-          author=$(jq -r '.[0].author.login' /tmp/pr.json)
-          is_bot=$(jq -r '.[0].author.is_bot' /tmp/pr.json)
+            --json number,author,assignees,baseRefName,headRefName,headRefOid,isCrossRepository,isDraft,labels,state > "$prs_file"
+          count=$(jq 'length' "$prs_file")
+          [ "$count" = "1" ] || stop stale_rejected "expected one open PR for '$BRANCH', found $count; skipping auto-fix."
+
+          num=$(jq -r '.[0].number' "$prs_file")
+          author=$(jq -r '.[0].author.login // ""' "$prs_file")
+          is_bot=$(jq -r '.[0].author.is_bot // false' "$prs_file")
           norm="${author#app/}"; norm="${norm%\[bot\]}"
-          xrepo=$(jq -r '.[0].isCrossRepository' /tmp/pr.json)
-          base=$(jq -r '.[0].baseRefName' /tmp/pr.json)
-          pr_sha=$(jq -r '.[0].headRefOid' /tmp/pr.json)
-          # HARD GUARDS: genuine App/Bot actor (is_bot) + allowlisted login + same-repo + base
-          # main. is_bot rules out a User with a slug colliding with our app name (a bare-login
-          # match alone would trust them); the allowlist restricts to our two trusted dep bots.
-          # Load-bearing on public repos. A guard hit here is anomalous (shouldn't reach autofix),
-          # so fail loudly.
-          [ "$is_bot" = "true" ]     || { echo "::error::author '$author' is not a bot/app"; exit 1; }
-          case "$norm" in dependabot|startupbros-autopilot) : ;; *) { echo "::error::author '$author' is not a trusted dep bot"; exit 1; } ;; esac
-          [ "$xrepo" = "false" ]     || { echo "::error::cross-repository PR not allowed"; exit 1; }
-          [ "$base" = "main" ]       || { echo "::error::base must be main, got '$base'"; exit 1; }
-          # FRESHNESS — the failed run must correspond to the CURRENT PR head; if the branch
-          # moved on (rebase / an earlier fix already landed), these logs are stale → skip.
-          run_sha=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json headSha -q '.headSha' 2>/dev/null || echo "")
-          if [ -n "$run_sha" ] && [ "$run_sha" != "$pr_sha" ]; then
-            skip "stale failure: run $RUN_ID was for $run_sha but PR #$num head is now $pr_sha; skipping."
+          xrepo=$(jq -r '.[0].isCrossRepository' "$prs_file")
+          base=$(jq -r '.[0].baseRefName // ""' "$prs_file")
+          head_branch=$(jq -r '.[0].headRefName // ""' "$prs_file")
+          pr_sha=$(jq -r '.[0].headRefOid // ""' "$prs_file")
+          { echo "number=$num"; echo "trigger_sha=$pr_sha"; } >> "$GITHUB_OUTPUT"
+
+          [ "$is_bot" = "true" ] || stop stale_rejected "author '$author' is not a bot/app; skipping auto-fix."
+          case "$norm" in dependabot|startupbros-autopilot) : ;; *) stop stale_rejected "author '$author' is not a trusted dependency bot; skipping auto-fix." ;; esac
+          [ "$xrepo" = "false" ] || stop stale_rejected "cross-repository PR; skipping auto-fix."
+          [ "$base" = "main" ] || stop stale_rejected "base must be main, got '$base'; skipping auto-fix."
+          [ "$head_branch" = "$BRANCH" ] || stop stale_rejected "PR head branch no longer matches the trigger; skipping auto-fix."
+          [ -n "$pr_sha" ] || stop stale_rejected "PR head SHA is missing; skipping auto-fix."
+          [ "$(jq -r '.[0].isDraft // false' "$prs_file")" = "false" ] || stop existing_owner "PR #$num is a draft; leaving it to its author."
+
+          for owner_label in pro-review skip-pro-review claimed loop-run; do
+            if jq -e --arg label "$owner_label" 'any(.[0].labels[]?; .name == $label)' "$prs_file" >/dev/null; then
+              stop existing_owner "PR #$num already carries '$owner_label'; skipping auto-fix."
+            fi
+          done
+          human_assignees=$(jq '[.[0].assignees[]? | select((.is_bot // false) != true)] | length' "$prs_file")
+          [ "$human_assignees" = "0" ] || stop existing_owner "PR #$num has a human assignee; skipping auto-fix."
+
+          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json event,headSha,url > "$run_file"
+          run_event=$(jq -r '.event // ""' "$run_file")
+          run_sha=$(jq -r '.headSha // ""' "$run_file")
+          [ "$run_event" = "pull_request" ] || stop stale_rejected "run $RUN_ID is not pull_request provenance; skipping auto-fix."
+          [ -n "$run_sha" ] || stop stale_rejected "run $RUN_ID has no head SHA; skipping auto-fix."
+          [ "$run_sha" = "$pr_sha" ] || stop stale_rejected "stale failure: run $RUN_ID was for $run_sha but PR #$num is now $pr_sha."
+
+          if [ -z "${CODEX_AUTH:-}" ] || [ -z "${APP_ID:-}" ] || [ -z "${APP_PRIVATE_KEY:-}" ]; then
+            stop unavailable_credentials "Auto-fix credentials are unavailable; terminal handoff will consider the unresolved red PR."
           fi
-          echo "Validated dependency PR #$num (head $pr_sha)."
-          { echo "ok=1"; echo "number=$num"; echo "base_sha=$pr_sha"; } >> "$GITHUB_OUTPUT"
+
+          echo "Validated dependency PR #$num at $pr_sha."
+          { echo "ok=1"; echo "outcome=admitted"; } >> "$GITHUB_OUTPUT"
 
       - name: Checkout PR branch (no persisted creds)
         if: steps.pre.outputs.ok == '1'
@@ -256,8 +299,6 @@ jobs:
         if: ${{ steps.pre.outputs.ok == '1' && inputs.ecosystem == 'pnpm' }}
         uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
-          # v6 self-installs via real npm into inputs#dest (default ~/setup-pnpm).
-          # Scope it per-workflow so shared-HOME/self-hosted runners never collide.
           dest: ~/setup-pnpm-autopilot
       - name: Setup Node
         if: ${{ steps.pre.outputs.ok == '1' && (inputs.ecosystem == 'pnpm' || inputs.ecosystem == 'npm') }}
@@ -287,41 +328,74 @@ jobs:
       - name: Codex — fix from the failed CI logs
         if: steps.pre.outputs.ok == '1'
         id: codex
+        # Shorter than the job's 30-minute timeout so a hang still leaves
+        # budget for the always()-run "Record auto-fix outcome" step below.
+        timeout-minutes: 20
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ inputs.ci_run_id }}
         run: |
+          set -euo pipefail
+          log_file="$RUNNER_TEMP/failed-ci.log"
+          last_file="$RUNNER_TEMP/codex-last.txt"
+          if ! gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --log-failed > "$log_file"; then
+            echo "outcome=failed_execution" >> "$GITHUB_OUTPUT"
+            echo "::error::failed to fetch logs for run $RUN_ID"
+            exit 1
+          fi
+          if [ ! -s "$log_file" ]; then
+            echo "outcome=failed_execution" >> "$GITHUB_OUTPUT"
+            echo "::error::no failed logs for run $RUN_ID"
+            exit 1
+          fi
+          echo "Fetched $(wc -l < "$log_file") lines of failed CI logs."
+
           set +e
-          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --log-failed > /tmp/fail.log 2>/dev/null
-          if [ ! -s /tmp/fail.log ]; then echo "::error::no failed logs for run $RUN_ID"; exit 1; fi
-          echo "Fetched $(wc -l < /tmp/fail.log) lines of failed CI logs."
-          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --log-failed \
-            | codex exec \
-                --sandbox workspace-write \
-                --skip-git-repo-check \
-                -c model_provider=openai \
-                -o /tmp/codex-last.txt \
-                "The failed CI logs for this dependency-update PR are on stdin. You ARE in the checked-out repo working tree — read and edit the source files directly. Make the MINIMAL application-code changes needed for compatibility with the new dependency versions so the build and tests pass. Do NOT change dependency versions, lockfiles, package.json/pyproject.toml, or workflow files. Do NOT refactor unrelated code. Prefer editing source over running installs. If you genuinely cannot fix it, stop and explain why."
-          echo "rc=$?" >> "$GITHUB_OUTPUT"
+          codex exec \
+            --sandbox workspace-write \
+            --skip-git-repo-check \
+            -c model_provider=openai \
+            -o "$last_file" \
+            "The failed CI logs for this dependency-update PR are on stdin. You ARE in the checked-out repo working tree — read and edit the source files directly. Make the MINIMAL application-code changes needed for compatibility with the new dependency versions so the build and tests pass. Do NOT change dependency versions, lockfiles, package.json/pyproject.toml, or workflow files. Do NOT refactor unrelated code. Prefer editing source over running installs. If you genuinely cannot fix it, stop and explain why." < "$log_file"
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
           echo "----- codex final message -----"
-          cat /tmp/codex-last.txt 2>/dev/null || true
-          exit 0
+          if [ -f "$last_file" ]; then cat "$last_file"; fi
+          if [ "$rc" -ne 0 ]; then
+            echo "outcome=failed_execution" >> "$GITHUB_OUTPUT"
+            echo "::error::Codex exited $rc"
+            exit "$rc"
+          fi
+          echo "outcome=codex_succeeded" >> "$GITHUB_OUTPUT"
 
       - name: Guard changed files
-        if: steps.pre.outputs.ok == '1'
+        if: ${{ steps.pre.outputs.ok == '1' && steps.codex.outcome == 'success' }}
         id: guard
         run: |
           set -euo pipefail
-          git diff --name-only > /tmp/changed.txt
-          echo "Changed files:"; cat /tmp/changed.txt
-          if [ ! -s /tmp/changed.txt ]; then
-            echo "::notice::Codex produced no changes (nothing to fix, or it declined)."
-            echo "changed=0" >> "$GITHUB_OUTPUT"; exit 0
+          changed_file="$RUNNER_TEMP/changed.txt"
+          {
+            # --no-renames: a collapsed rename reports only the destination,
+            # which would hide a staged move away from a protected source
+            # (e.g. `git mv package.json src/package.ts`).
+            git diff --name-only --no-renames HEAD
+            git ls-files --others --exclude-standard
+          } | sort -u > "$changed_file"
+          echo "Changed files:"
+          if [ -s "$changed_file" ]; then cat "$changed_file"; fi
+          if [ ! -s "$changed_file" ]; then
+            echo "::notice::Codex produced no changes."
+            echo "outcome=no_changes" >> "$GITHUB_OUTPUT"
+            echo "changed=0" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          if grep -E '(^|/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock|bun\.lock|package\.json|pyproject\.toml|uv\.lock|poetry\.lock)$|^\.github/workflows/' /tmp/changed.txt; then
-            echo "::error::Codex touched dependency/lockfile/workflow files — refusing to auto-commit."
+          if grep -E '(^|/)(pnpm-lock\.yaml|pnpm-workspace\.yaml|package-lock\.json|yarn\.lock|bun\.lock|package\.json|pyproject\.toml|uv\.lock|poetry\.lock)$|^\.github/workflows/' "$changed_file"; then
+            echo "outcome=failed_execution" >> "$GITHUB_OUTPUT"
+            echo "::error::Codex touched dependency, lockfile, or workflow files; refusing to commit."
             exit 1
           fi
+          echo "outcome=changes_ready" >> "$GITHUB_OUTPUT"
           echo "changed=1" >> "$GITHUB_OUTPUT"
 
       - name: Mint a short-lived GitHub App token (scoped to this repo)
@@ -332,49 +406,301 @@ jobs:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
-      - name: Commit + push the fix (re-triggers CI)
+      - name: Hold the PR for review before publishing an AI fix
         if: ${{ steps.pre.outputs.ok == '1' && steps.guard.outputs.changed == '1' }}
+        id: flag
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          NUM: ${{ steps.pre.outputs.number }}
+          TRIGGER_SHA: ${{ steps.pre.outputs.trigger_sha }}
+          BRANCH: ${{ inputs.pr_branch }}
+        run: |
+          set -euo pipefail
+          fresh_file="$RUNNER_TEMP/before-push.json"
+          gh pr view "$NUM" --repo "$GITHUB_REPOSITORY" \
+            --json headRefOid,state,isDraft,labels,assignees,baseRefName,headRefName > "$fresh_file"
+          # Recheck the same base/branch trust invariant admission and the
+          # terminal handoff enforce: a retarget away from main while Codex
+          # is running must not reach the label/push below.
+          if ! jq -e --arg sha "$TRIGGER_SHA" --arg branch "$BRANCH" \
+               '.headRefOid == $sha and .state == "OPEN" and .isDraft == false and .baseRefName == "main" and .headRefName == $branch' \
+               "$fresh_file" >/dev/null; then
+            echo "outcome=stale_rejected" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if jq -e 'any(.labels[]?; .name | IN("pro-review", "skip-pro-review", "claimed", "loop-run")) or
+                    any(.assignees[]?; (.is_bot // false) != true)' "$fresh_file" >/dev/null; then
+            echo "outcome=existing_owner" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Hold before pushing: a failed label write must not leave AI changes
+          # eligible for the existing automerge path. A failed push keeps the hold.
+          gh label create "autopilot:autofixed" --repo "$GITHUB_REPOSITORY" \
+            --color d93f0b --description "Autopilot: AI fix attempted — review before merge" \
+            || gh api "repos/$GITHUB_REPOSITORY/labels/autopilot:autofixed" --silent
+          gh pr edit "$NUM" --repo "$GITHUB_REPOSITORY" --add-label "autopilot:autofixed"
+          echo "flagged=1" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push the fix (re-triggers CI)
+        if: ${{ steps.pre.outputs.ok == '1' && steps.guard.outputs.changed == '1' && steps.flag.outputs.flagged == '1' }}
         id: push
         env:
           PUSH_TOKEN: ${{ steps.app.outputs.token }}
           BRANCH: ${{ inputs.pr_branch }}
-          BASE_SHA: ${{ steps.pre.outputs.base_sha }}
+          TRIGGER_SHA: ${{ steps.pre.outputs.trigger_sha }}
         run: |
           set -euo pipefail
-          # Pre-push freshness: if the remote branch advanced since we checked out
-          # (a concurrent fix already landed, or a rebase), don't push a fix built on
-          # stale code — skip cleanly rather than force a non-fast-forward.
           git fetch -q origin "$BRANCH"
           remote_sha=$(git rev-parse "origin/$BRANCH")
-          if [ "$remote_sha" != "$BASE_SHA" ]; then
-            echo "::notice::branch advanced ($BASE_SHA -> $remote_sha) since checkout — another fix already landed; skipping push."
+          if [ "$remote_sha" != "$TRIGGER_SHA" ]; then
+            echo "::notice::branch advanced ($TRIGGER_SHA -> $remote_sha); refusing a stale push."
+            echo "outcome=stale_rejected" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git config user.name "codex-autofix"
           git config user.email "codex-autofix@users.noreply.github.com"
-          git add -A
+          git --literal-pathspecs add --pathspec-from-file="$RUNNER_TEMP/changed.txt"
           git commit -m "fix(deps): Codex auto-fix for dependency breakage"
-          # BRANCH via env (never interpolate event data into the shell).
+          pushed_sha=$(git rev-parse HEAD)
           git push "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:$BRANCH"
-          echo "pushed=1" >> "$GITHUB_OUTPUT"
-          echo "::notice::Pushed via short-lived GitHub App token — CI will re-run to validate the fix."
+          { echo "outcome=successful_push"; echo "pushed_sha=$pushed_sha"; } >> "$GITHUB_OUTPUT"
+          echo "::notice::Pushed $pushed_sha via a short-lived GitHub App token; CI will re-run."
 
-      - name: Flag the PR as AI-authored (review before merge)
-        if: ${{ steps.pre.outputs.ok == '1' && steps.push.outputs.pushed == '1' }}
+      - name: Record auto-fix outcome
+        if: always()
+        id: result
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-          NUM: ${{ steps.pre.outputs.number }}
+          PRE_OUTCOME: ${{ steps.pre.outputs.outcome }}
+          CODEX_STATUS: ${{ steps.codex.outcome }}
+          GUARD_OUTCOME: ${{ steps.guard.outputs.outcome }}
+          PUSH_OUTCOME: ${{ steps.push.outputs.outcome }}
+          FLAG_STATUS: ${{ steps.flag.outcome }}
+          FLAG_OUTCOME: ${{ steps.flag.outputs.outcome }}
+          FLAGGED: ${{ steps.flag.outputs.flagged }}
         run: |
           set -euo pipefail
-          # A fix was actually pushed → this PR now contains AI-written code. The label is
-          # LOAD-BEARING: triage forces tier=review when it's present, so this PR can never
-          # auto-merge. Failing to apply it must fail the job (don't let AI code slip through
-          # unflagged). Only the "label already exists" case is ignorable.
-          gh label create "autopilot:autofixed" --repo "$GITHUB_REPOSITORY" \
-            --color d93f0b --description "Autopilot: contains AI-authored fix code — review before merge" 2>/dev/null || true
-          # pro-review opts this PR into the GPT-5.5 Pro Extended gate (pro-review-daemon),
-          # so every AI-authored fix is deep-reviewed before a human merges it.
+          case "$PRE_OUTCOME" in
+            unavailable_credentials|stale_rejected|existing_owner)
+              outcome="$PRE_OUTCOME"
+              ;;
+            admitted)
+              if [ "$CODEX_STATUS" = "failure" ] || [ "$GUARD_OUTCOME" = "failed_execution" ]; then
+                outcome="failed_execution"
+              elif [ "$GUARD_OUTCOME" = "no_changes" ]; then
+                outcome="no_changes"
+              elif [ "${FLAG_OUTCOME:-}" = "existing_owner" ]; then
+                outcome="existing_owner"
+              elif [ "$PUSH_OUTCOME" = "stale_rejected" ] || [ "${FLAG_OUTCOME:-}" = "stale_rejected" ]; then
+                outcome="stale_rejected"
+              elif [ "$PUSH_OUTCOME" = "successful_push" ] && [ "$FLAG_STATUS" = "success" ] && [ "$FLAGGED" = "1" ]; then
+                outcome="successful_push"
+              else
+                outcome="failed_execution"
+              fi
+              ;;
+            *) outcome="failed_execution" ;;
+          esac
+          echo "outcome=$outcome" >> "$GITHUB_OUTPUT"
+          echo "Auto-fix outcome: $outcome"
+
+  # ---------------- TERMINAL HANDOFF: one owner after the producer finishes ----------------
+  handoff:
+    needs: [triage, autofix]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: read
+    steps:
+      - name: Revalidate and queue the existing pro-review daemon
+        id: handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ inputs.pr_branch }}
+          RUN_ID: ${{ inputs.ci_run_id }}
+          CI_CONCLUSION: ${{ inputs.ci_conclusion }}
+          TRIAGE_RESULT: ${{ needs.triage.result }}
+          TRIAGE_OUTCOME: ${{ needs.triage.outputs.outcome }}
+          TRIAGE_NUMBER: ${{ needs.triage.outputs.number }}
+          TRIAGE_TRIGGER_SHA: ${{ needs.triage.outputs.trigger_sha }}
+          AUTOFIX_RESULT: ${{ needs.autofix.result }}
+          AUTOFIX_OUTCOME: ${{ needs.autofix.outputs.outcome }}
+          AUTOFIX_NUMBER: ${{ needs.autofix.outputs.number }}
+          AUTOFIX_TRIGGER_SHA: ${{ needs.autofix.outputs.trigger_sha }}
+          AUTOFIX_PUSHED_SHA: ${{ needs.autofix.outputs.pushed_sha }}
+        run: |
+          set -euo pipefail
+          handoff_status="failed"
+          detail="metadata or API validation failed"
+          producer_outcome="unknown"
+          num=""
+          expected_sha=""
+          trigger_sha=""
+          run_url=""
+          summarize() {
+            rc=$?
+            {
+              echo "### Dependency autopilot"
+              echo "- PR: ${num:-unknown}"
+              echo "- Producer outcome: $producer_outcome"
+              echo "- Handoff: $handoff_status"
+              echo "- Detail: $detail"
+            } >> "$GITHUB_STEP_SUMMARY"
+            return "$rc"
+          }
+          trap summarize EXIT
+          skip() {
+            handoff_status="skipped"
+            detail="$1"
+            echo "::notice::$1"
+            exit 0
+          }
+          fail() {
+            detail="$1"
+            echo "::error::$1"
+            exit 1
+          }
+
+          if [ "$CI_CONCLUSION" = "success" ]; then
+            producer_outcome="$TRIAGE_OUTCOME"
+            [ "$TRIAGE_RESULT" = "success" ] || fail "triage did not finish successfully"
+            case "$producer_outcome" in
+              green_safe) skip "safe green PRs stay in the inexpensive ready queue" ;;
+              review_held) : ;;
+              existing_owner) skip "an existing review or active owner already controls this PR" ;;
+              stale_rejected) skip "triage rejected a stale or ineligible target" ;;
+              *) fail "triage returned missing or failed outcome metadata" ;;
+            esac
+            num="$TRIAGE_NUMBER"
+            trigger_sha="$TRIAGE_TRIGGER_SHA"
+            expected_sha="$trigger_sha"
+          elif [ "$CI_CONCLUSION" = "failure" ] || [ "$CI_CONCLUSION" = "timed_out" ] \
+               || [ "$CI_CONCLUSION" = "action_required" ] || [ "$CI_CONCLUSION" = "startup_failure" ]; then
+            producer_outcome="$AUTOFIX_OUTCOME"
+            # A forced job termination (job-level timeout, lost runner) skips
+            # the always()-run result step, so the outcome output is empty.
+            # Only infer failed_execution when the job itself reports
+            # "failure" (never "cancelled" — that is not unresolved repair
+            # work) AND the producer already bound identity before it died;
+            # a missing binding still falls through to the fail-closed case.
+            if [ -z "$producer_outcome" ] && [ "$AUTOFIX_RESULT" = "failure" ] \
+               && [ -n "$AUTOFIX_NUMBER" ] && [ -n "$AUTOFIX_TRIGGER_SHA" ]; then
+              producer_outcome="failed_execution"
+            fi
+            case "$producer_outcome" in
+              successful_push)
+                [ "$AUTOFIX_RESULT" = "success" ] || fail "a pushed fix was not fully flagged"
+                expected_sha="$AUTOFIX_PUSHED_SHA"
+                ;;
+              no_changes|unavailable_credentials)
+                [ "$AUTOFIX_RESULT" = "success" ] || fail "unresolved auto-fix metadata is inconsistent"
+                expected_sha="$AUTOFIX_TRIGGER_SHA"
+                ;;
+              existing_owner) skip "an existing review or active owner already controls this PR" ;;
+              stale_rejected) skip "auto-fix rejected a stale or ineligible target" ;;
+              failed_execution)
+                # A failed repair is unresolved work, not a clean no-op. Only the
+                # unchanged, independently revalidated PR is eligible below.
+                expected_sha="$AUTOFIX_TRIGGER_SHA"
+                ;;
+              *) fail "auto-fix returned missing outcome metadata" ;;
+            esac
+            num="$AUTOFIX_NUMBER"
+            trigger_sha="$AUTOFIX_TRIGGER_SHA"
+          else
+            # cancelled, neutral, skipped, and any other conclusion outside
+            # the autofix job's own gate are deliberately not routed here.
+            producer_outcome="not_applicable"
+            skip "CI conclusion '$CI_CONCLUSION' has no handoff path"
+          fi
+
+          [ -n "$num" ] || fail "producer did not supply a PR number"
+          [ -n "$trigger_sha" ] || fail "producer did not supply the triggering PR head"
+          [ -n "$expected_sha" ] || fail "producer did not supply the expected terminal head"
+
+          run_file="$RUNNER_TEMP/handoff-run.json"
+          prs_file="$RUNNER_TEMP/handoff-prs.json"
+          candidate_file="$RUNNER_TEMP/handoff-candidate.json"
+          fresh_file="$RUNNER_TEMP/handoff-fresh.json"
+          comments_file="$RUNNER_TEMP/handoff-comments.json"
+
+          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json event,headSha,url > "$run_file"
+          run_event=$(jq -r '.event // ""' "$run_file")
+          run_sha=$(jq -r '.headSha // ""' "$run_file")
+          run_url=$(jq -r '.url // ""' "$run_file")
+          [ "$run_event" = "pull_request" ] || fail "triggering run is not pull_request provenance"
+          [ -n "$run_sha" ] || fail "triggering run head SHA is missing"
+          [ -n "$run_url" ] || fail "triggering run URL is missing"
+          [ "$run_sha" = "$trigger_sha" ] || fail "producer provenance does not match the triggering run head"
+
+          gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open \
+            --json number,author,assignees,baseRefName,headRefName,headRefOid,isCrossRepository,isDraft,labels,state > "$prs_file"
+          count=$(jq 'length' "$prs_file")
+          [ "$count" = "1" ] || skip "target is closed, missing, or ambiguous"
+          jq '.[0]' "$prs_file" > "$candidate_file"
+
+          block_reason=""
+          validate_target() {
+            local file="$1" author is_bot norm xrepo base head_branch head_sha state human_assignees owner_label
+            author=$(jq -r '.author.login // ""' "$file")
+            is_bot=$(jq -r '.author.is_bot // false' "$file")
+            norm="${author#app/}"; norm="${norm%\[bot\]}"
+            xrepo=$(jq -r '.isCrossRepository' "$file")
+            base=$(jq -r '.baseRefName // ""' "$file")
+            head_branch=$(jq -r '.headRefName // ""' "$file")
+            head_sha=$(jq -r '.headRefOid // ""' "$file")
+            state=$(jq -r '.state // ""' "$file")
+            [ "$is_bot" = "true" ] || { block_reason="author is not a bot/app"; return 1; }
+            case "$norm" in dependabot|startupbros-autopilot) : ;; *) block_reason="author is not an allowlisted dependency bot"; return 1 ;; esac
+            [ "$xrepo" = "false" ] || { block_reason="cross-repository target"; return 1; }
+            [ "$base" = "main" ] || { block_reason="base is not main"; return 1; }
+            [ "$head_branch" = "$BRANCH" ] || { block_reason="head branch changed"; return 1; }
+            [ "$head_sha" = "$expected_sha" ] || { block_reason="head moved from expected $expected_sha to $head_sha"; return 1; }
+            case "$state" in OPEN|open) : ;; *) block_reason="PR is not open"; return 1 ;; esac
+            [ "$(jq -r '.isDraft // false' "$file")" = "false" ] || { block_reason="PR is a draft"; return 1; }
+            for owner_label in pro-review skip-pro-review claimed loop-run; do
+              if jq -e --arg label "$owner_label" 'any(.labels[]?; .name == $label)' "$file" >/dev/null; then
+                block_reason="existing owner label '$owner_label'"
+                return 1
+              fi
+            done
+            human_assignees=$(jq '[.assignees[]? | select((.is_bot // false) != true)] | length' "$file")
+            [ "$human_assignees" = "0" ] || { block_reason="human assignee already owns the PR"; return 1; }
+          }
+
+          candidate_num=$(jq -r '.number' "$candidate_file")
+          [ "$candidate_num" = "$num" ] || skip "producer PR number no longer matches the branch target"
+          if ! validate_target "$candidate_file"; then skip "$block_reason"; fi
+
+          # Refresh before any mutation. PR labels are not an atomic SHA lease;
+          # the consumer must still bind its effects to the head it actually reads.
+          gh pr view "$num" --repo "$GITHUB_REPOSITORY" \
+            --json number,state,author,assignees,baseRefName,headRefName,headRefOid,isCrossRepository,isDraft,labels > "$fresh_file"
+          if ! validate_target "$fresh_file"; then skip "$block_reason"; fi
+
+          marker="<!-- dependency-autopilot-handoff:$expected_sha -->"
+          gh api "repos/$GITHUB_REPOSITORY/issues/$num/comments?per_page=100" --paginate --slurp > "$comments_file"
+          if ! jq -e --arg marker "$marker" 'any(.[][]?; (.body // "") | contains($marker))' "$comments_file" >/dev/null; then
+            body=$(printf '%s\n%s\n%s\n%s\n%s' \
+              "$marker" \
+              "Requesting review for PR #$num at \`$expected_sha\`." \
+              "Producer outcome: \`$producer_outcome\`." \
+              "Source CI: $run_url" \
+              "Next owner: the existing pro-review daemon once the pro-review label is present. This request is not a completed review or a merge; see the handoff job for enqueue failures.")
+            gh pr comment "$num" --repo "$GITHUB_REPOSITORY" --body "$body"
+          fi
           gh label create "pro-review" --repo "$GITHUB_REPOSITORY" \
-            --color 5319e7 --description "GPT-5.5 Pro Extended final gate (pro-review-daemon)" 2>/dev/null || true
-          [ -n "$NUM" ] || { echo "::error::no PR number to flag — refusing to leave an AI fix unflagged"; exit 1; }
-          gh pr edit "$NUM" --repo "$GITHUB_REPOSITORY" --add-label "autopilot:autofixed" --add-label "pro-review"
+            --color 5319e7 --description "Existing pro-review daemon queue" \
+            || gh api "repos/$GITHUB_REPOSITORY/labels/pro-review" --silent
+          # Recheck after the audit write as well: a new author or head may have
+          # arrived during API calls. Repeated events reuse the request above.
+          gh pr view "$num" --repo "$GITHUB_REPOSITORY" \
+            --json number,state,author,assignees,baseRefName,headRefName,headRefOid,isCrossRepository,isDraft,labels > "$fresh_file"
+          if ! validate_target "$fresh_file"; then skip "$block_reason"; fi
+          gh pr edit "$num" --repo "$GITHUB_REPOSITORY" --add-label "pro-review"
+
+          handoff_status="queued"
+          detail="queued $expected_sha for the existing pro-review daemon; consumption is verified separately"
+          echo "::notice::$detail"

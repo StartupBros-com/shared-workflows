@@ -1,10 +1,7 @@
 name: CI
 
-# The tier classifier is a shell block inside a reusable workflow consumed by
-# every repo in the org, so a misclassification ships everywhere at once and is
-# invisible until a PR is labelled wrong. It had no test because nothing could
-# execute a `run:` block in isolation. tests/classify-tier.test.sh mirrors that
-# logic against real PR titles; this runs it.
+# Keep the historical classifier fixtures and exercise the reusable workflow's
+# actual shell blocks, including producer-to-handoff transitions.
 
 on:
   pull_request:
@@ -26,6 +23,11 @@ jobs:
 
       - name: Classifier fixtures
         run: bash tests/classify-tier.test.sh
+
+      - name: Executable workflow tests
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
 
       - name: Workflows parse as YAML
         run: |
