@@ -5,6 +5,7 @@ import re
 import subprocess
 import unittest
 
+import autopilot_harness
 from autopilot_harness import (
     NEW_SHA,
     OLD_SHA,
@@ -13,6 +14,7 @@ from autopilot_harness import (
     WORKFLOW,
     RealGitHarness,
     ShellHarness,
+    iso_minutes_ago,
     step,
     trusted_pr,
 )
@@ -22,55 +24,28 @@ class WorkflowTests(unittest.TestCase):
     maxDiff = None
 
     def harness(self, **config):
-        harness = ShellHarness({"prs": [trusted_pr()], "run": RUN} | config)
-        self.addCleanup(harness.temp.cleanup)
-        return harness
+        return autopilot_harness.make_shell_harness(self, **config)
 
     def real_git_harness(self, files):
-        harness = RealGitHarness(files)
-        self.addCleanup(harness.cleanup)
-        return harness
+        return autopilot_harness.make_real_git_harness(self, files)
 
     def success(self, result):
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        autopilot_harness.assert_success(self, result)
 
     def handoff(self, harness, **changes):
-        env = {
-            "CI_CONCLUSION": "success", "TRIAGE_RESULT": "success",
-            "TRIAGE_OUTCOME": "review_held", "TRIAGE_NUMBER": "21",
-            "TRIAGE_TRIGGER_SHA": OLD_SHA, "AUTOFIX_RESULT": "skipped",
-            "AUTOFIX_OUTCOME": "", "AUTOFIX_NUMBER": "",
-            "AUTOFIX_TRIGGER_SHA": "", "AUTOFIX_PUSHED_SHA": "",
-        } | changes
-        return harness.run("handoff", "handoff", **env)
+        return autopilot_harness.run_handoff(harness, **changes)
 
     def red_handoff(self, harness, outcome="no_changes", **changes):
-        return self.handoff(harness, **({
-            "CI_CONCLUSION": "failure", "TRIAGE_RESULT": "skipped",
-            "TRIAGE_OUTCOME": "", "AUTOFIX_RESULT": "success",
-            "AUTOFIX_OUTCOME": outcome, "AUTOFIX_NUMBER": "21",
-            "AUTOFIX_TRIGGER_SHA": OLD_SHA,
-        } | changes))
+        return autopilot_harness.run_red_handoff(harness, outcome=outcome, **changes)
 
     def mutation_calls(self, harness):
-        return [c for c in harness.calls() if c[:3] in (
-            ["gh", "pr", "edit"], ["gh", "pr", "comment"],
-            ["gh", "pr", "merge"], ["gh", "label", "create"],
-        ) or c[:2] == ["git", "push"]]
+        return autopilot_harness.mutation_calls(harness)
 
     def assert_queued(self, harness):
-        edits = [c for c in harness.calls() if c[:3] == ["gh", "pr", "edit"] and "pro-review" in c]
-        self.assertEqual(len(edits), 1, harness.calls())
-        self.assertIn("Handoff: queued", harness.summary.read_text())
-        self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+        autopilot_harness.assert_queued(self, harness)
 
     def assert_root_concurrency(self, workflow):
-        self.assertIn("github.repository", workflow["concurrency"]["group"])
-        self.assertIn("inputs.pr_branch", workflow["concurrency"]["group"])
-        self.assertEqual(workflow["concurrency"]["queue"], "max")
-        self.assertFalse(workflow["concurrency"]["cancel-in-progress"])
-        for job_name, candidate in workflow["jobs"].items():
-            self.assertNotIn("concurrency", candidate, job_name)
+        autopilot_harness.assert_root_concurrency(self, workflow)
 
     def test_graph_serializes_producers_then_handoff(self):
         job = WORKFLOW["jobs"]["handoff"]
@@ -487,6 +462,57 @@ class WorkflowTests(unittest.TestCase):
         )
         self.success(harness.run("triage", "triage"))
         self.assertEqual(harness.outputs()["outcome"], "ci_unresolved")
+
+    def test_failure_like_sibling_within_grace_window_still_defers(self):
+        # Same mechanism as above, made explicit: a sibling failure that
+        # completed 5 minutes ago is well inside the grace window, so its
+        # own repair attempt is still plausibly in flight — this preserves
+        # repair-before-review ordering.
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            runs={"workflow_runs": [
+                {"workflow_id": 1, "run_number": 1, "conclusion": "success"},
+                {"workflow_id": 2, "run_number": 1, "conclusion": "failure",
+                 "updated_at": iso_minutes_ago(5)},
+            ]},
+        )
+        self.success(harness.run("triage", "triage"))
+        producer = harness.outputs()
+        self.assertEqual(producer["outcome"], "ci_unresolved")
+        self.success(self.handoff(
+            harness,
+            TRIAGE_OUTCOME=producer["outcome"],
+            TRIAGE_NUMBER=producer["number"],
+            TRIAGE_TRIGGER_SHA=producer["trigger_sha"],
+        ))
+        self.assertFalse(any("pro-review" in c for c in harness.calls()))
+
+    def test_failure_like_sibling_past_grace_window_reconciles_and_hands_off(self):
+        # If that sibling's own autopilot invocation died before it ever
+        # established ownership (a transient API failure in its handoff
+        # job, a lost runner), its watched completion event already fired
+        # and nothing will retry it. Once its completion is old enough that
+        # a genuine repair attempt is no longer plausible, the deferral must
+        # end so the PR reconciles to a definite owner instead of waiting on
+        # an event that will never arrive.
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            runs={"workflow_runs": [
+                {"workflow_id": 1, "run_number": 1, "conclusion": "success"},
+                {"workflow_id": 2, "run_number": 1, "conclusion": "failure",
+                 "updated_at": iso_minutes_ago(50)},
+            ]},
+        )
+        self.success(harness.run("triage", "triage"))
+        producer = harness.outputs()
+        self.assertEqual(producer["outcome"], "review_held")
+        self.success(self.handoff(
+            harness,
+            TRIAGE_OUTCOME=producer["outcome"],
+            TRIAGE_NUMBER=producer["number"],
+            TRIAGE_TRIGGER_SHA=producer["trigger_sha"],
+        ))
+        self.assert_queued(harness)
 
     def test_forced_termination_with_bound_metadata_falls_back_to_failed_execution(self):
         harness = self.harness()

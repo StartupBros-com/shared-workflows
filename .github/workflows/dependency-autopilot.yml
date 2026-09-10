@@ -159,23 +159,71 @@ jobs:
           # A separate, narrower signal for ci_unresolved vs review_held.
           # `unresolved` means a real future event is still owed for this
           # head: either a run that has not completed yet (conclusion is
-          # still null), or a run whose conclusion is in the repair set,
-          # because THAT workflow's own completion routes to autofix (a
-          # genuine repair attempt) rather than back through here — handing
-          # off to review now would race that attempt and could starve it
-          # (admission treats an existing pro-review label as another
-          # owner). Every other terminal conclusion (success, skipped,
-          # neutral, cancelled, stale, or any future value) only ever
-          # reconciles here, so once it has already concluded there is
-          # nothing further to wait for.
+          # still null — GitHub will eventually terminate it, and THAT
+          # completion is the next watched event), or a run whose
+          # conclusion is in the repair set, because THAT workflow's own
+          # completion is expected to route to autofix (a genuine repair
+          # attempt) rather than back through here — handing off to review
+          # now would race that attempt and could starve it (admission
+          # treats an existing pro-review label as another owner).
           #
-          # Zero genuine successes is NOT, by itself, unresolved: a fully
-          # terminal inventory with no success (e.g. skipped/neutral/
-          # cancelled/stale only) must reconcile to review_held, not be
-          # labelled ci_unresolved forever waiting on an event that already
-          # happened. `allgreen` above is the sole gate on merge eligibility.
-          still_owed=$(jq --argjson repair '["failure","timed_out","action_required","startup_failure"]' '
-                    [ .[] | select(.conclusion == null or (.conclusion as $c | $repair | any(. == $c))) ] | length' <<<"$latest")
+          # But a failure-like sibling's repair attempt is not guaranteed to
+          # run: its autopilot invocation can die before it ever
+          # establishes ownership (a transient API failure in its handoff
+          # job, a lost runner) — and once that sibling's own completion
+          # event has already fired, nothing will retry it. An unbounded
+          # defer on that conclusion would then hold the PR forever with no
+          # owner. So the defer on a repair-set conclusion is bounded by
+          # that sibling's OWN completion time (`updated_at` — this list
+          # endpoint exposes no dedicated completed_at, and updated_at is
+          # set when the run's status/conclusion last changed). Within
+          # GRACE_SECONDS of that completion we keep deferring exactly as
+          # before — this preserves repair-before-review ordering, the
+          # whole reason the defer exists: reconciling a red inventory to
+          # review_held immediately would label pro-review, and autofix
+          # admission would then refuse it as an existing owner, killing
+          # repair. Past the window with ownership still not established,
+          # that run stops counting as owed and falls through to
+          # review_held so the PR gets a definite owner. A missing or
+          # unparseable `updated_at` is treated as within the window — fail
+          # toward the existing defer, not toward a premature review_held.
+          #
+          # HONEST LIMIT: this bounds the wait only when a LATER watched
+          # completion event arrives to re-run this reconciliation. If the
+          # failed sibling's own completion is the last event that will
+          # ever fire for this head, nothing inside this workflow triggers
+          # again to notice the window has passed. Closing that residual
+          # gap needs a caller-side scheduled sweep; see README.md.
+          #
+          # Every other terminal conclusion (success, skipped, neutral,
+          # cancelled, stale, or any future value) only ever reconciles
+          # here, so once it has already concluded there is nothing further
+          # to wait for. Zero genuine successes is NOT, by itself,
+          # unresolved: a fully terminal inventory with no success (e.g.
+          # skipped/neutral/cancelled/stale only) must reconcile to
+          # review_held, not be labelled ci_unresolved forever waiting on an
+          # event that already happened. `allgreen` above is the sole gate
+          # on merge eligibility.
+          #
+          # GRACE_SECONDS is set comfortably above the sum of the two job
+          # timeouts a sibling's own repair attempt would need to clear
+          # before establishing ownership: autofix's 30 minutes plus
+          # handoff's 8 minutes (38 total), rounded up to 45 minutes to
+          # leave headroom for runner queueing delay before either job even
+          # starts.
+          GRACE_SECONDS=$((45 * 60))
+          now_epoch=$(date -u +%s)
+          still_owed=$(jq --argjson repair '["failure","timed_out","action_required","startup_failure"]' \
+                    --argjson now "$now_epoch" --argjson grace "$GRACE_SECONDS" '
+                    def within_grace:
+                      (.updated_at // null) as $u
+                      | ($u == null) or (
+                          try (($now - ($u | fromdateiso8601)) <= $grace) catch true
+                        );
+                    [ .[] | select(
+                        .conclusion == null
+                        or ((.conclusion as $c | $repair | any(. == $c)) and within_grace)
+                      ) ] | length' <<<"$latest")
           unresolved=0
           [ "$total" -eq 0 ] && unresolved=1
           [ "$still_owed" -gt 0 ] && unresolved=1

@@ -35,7 +35,11 @@ Dependabot / Renovate PR -> CI completes
     a run for this head is still genuinely pending (no conclusion yet), or a
       sibling's own conclusion is itself in the repair set (its own event
       still owes a repair attempt) -> keep the conservative hold; defer
-      handoff so review does not race that repair
+      handoff so review does not race that repair. A repair-set sibling is
+      only owed within a bounded grace window of ITS OWN completion time
+      (45 minutes); past that window with no ownership established, it
+      stops counting as owed so the PR still reaches a definite owner
+      instead of waiting on a retry that will never come
     all accepted + at least one success + safe -> existing ready queue (or
       merge when caller selects automerge)
     all accepted + held, OR a fully terminal inventory with zero genuine
@@ -118,6 +122,25 @@ expected, not evidence of a dependency-workflow outage.
   never arrive. This holds even for a fully terminal inventory with zero
   genuine successes (e.g. skipped/neutral/cancelled/stale only) — it reconciles
   to `review_held`, not an eternal `ci_unresolved`.
+  - **Bounded deferral, not an eternal one:** a repair-set sibling only owes
+    its repair attempt within a 45-minute grace window of that sibling's OWN
+    completion (`updated_at` on its run — comfortably above autofix's
+    30-minute plus handoff's 8-minute job timeouts, with headroom for runner
+    queueing delay). Inside the window, the hold is unchanged. Past it, with
+    ownership still not established, that run stops counting as owed and
+    reconciliation proceeds to `review_held` — this covers the case where the
+    sibling's own autopilot invocation died before it ever labeled the PR (a
+    transient API failure in its handoff job, a lost runner), which would
+    otherwise strand the PR forever on a completion event that already fired
+    and will not repeat.
+  - **Known boundary:** the grace window is only checked when a LATER watched
+    completion event arrives and re-runs this reconciliation. If the failed
+    sibling's own completion is the last event that will ever fire for a
+    given head, nothing inside this workflow triggers again to notice the
+    window has passed, and the PR stays held. Closing that residual gap
+    needs a caller-side scheduled sweep (e.g. a periodic workflow that lists
+    PRs still carrying `autopilot:review` without `pro-review` and re-invokes
+    reconciliation for any past the grace window) — not implemented here.
 - **Review held:** only an all-green risk hold is eligible for the existing
   `pro-review` intake after fresh checks. A triggering conclusion is success
   evidence only when it is literally `success`, `skipped`, or `neutral` — a

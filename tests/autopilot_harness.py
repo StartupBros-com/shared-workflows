@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -23,6 +24,70 @@ RUN = {
 
 def step(job, step_id):
     return next(item for item in WORKFLOW["jobs"][job]["steps"] if item.get("id") == step_id)
+
+
+def iso_minutes_ago(minutes):
+    """An `updated_at`-shaped timestamp `minutes` before now, for grace-window tests."""
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def make_shell_harness(testcase, **config):
+    harness = ShellHarness({"prs": [trusted_pr()], "run": RUN} | config)
+    testcase.addCleanup(harness.temp.cleanup)
+    return harness
+
+
+def make_real_git_harness(testcase, files):
+    harness = RealGitHarness(files)
+    testcase.addCleanup(harness.cleanup)
+    return harness
+
+
+def assert_success(testcase, result):
+    testcase.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+def run_handoff(harness, **changes):
+    env = {
+        "CI_CONCLUSION": "success", "TRIAGE_RESULT": "success",
+        "TRIAGE_OUTCOME": "review_held", "TRIAGE_NUMBER": "21",
+        "TRIAGE_TRIGGER_SHA": OLD_SHA, "AUTOFIX_RESULT": "skipped",
+        "AUTOFIX_OUTCOME": "", "AUTOFIX_NUMBER": "",
+        "AUTOFIX_TRIGGER_SHA": "", "AUTOFIX_PUSHED_SHA": "",
+    } | changes
+    return harness.run("handoff", "handoff", **env)
+
+
+def run_red_handoff(harness, outcome="no_changes", **changes):
+    return run_handoff(harness, **({
+        "CI_CONCLUSION": "failure", "TRIAGE_RESULT": "skipped",
+        "TRIAGE_OUTCOME": "", "AUTOFIX_RESULT": "success",
+        "AUTOFIX_OUTCOME": outcome, "AUTOFIX_NUMBER": "21",
+        "AUTOFIX_TRIGGER_SHA": OLD_SHA,
+    } | changes))
+
+
+def mutation_calls(harness):
+    return [c for c in harness.calls() if c[:3] in (
+        ["gh", "pr", "edit"], ["gh", "pr", "comment"],
+        ["gh", "pr", "merge"], ["gh", "label", "create"],
+    ) or c[:2] == ["git", "push"]]
+
+
+def assert_queued(testcase, harness):
+    edits = [c for c in harness.calls() if c[:3] == ["gh", "pr", "edit"] and "pro-review" in c]
+    testcase.assertEqual(len(edits), 1, harness.calls())
+    testcase.assertIn("Handoff: queued", harness.summary.read_text())
+    testcase.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+
+
+def assert_root_concurrency(testcase, workflow):
+    testcase.assertIn("github.repository", workflow["concurrency"]["group"])
+    testcase.assertIn("inputs.pr_branch", workflow["concurrency"]["group"])
+    testcase.assertEqual(workflow["concurrency"]["queue"], "max")
+    testcase.assertFalse(workflow["concurrency"]["cancel-in-progress"])
+    for job_name, candidate in workflow["jobs"].items():
+        testcase.assertNotIn("concurrency", candidate, job_name)
 
 
 def trusted_pr(**changes):
