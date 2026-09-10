@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -23,6 +24,34 @@ RUN = {
 
 def step(job, step_id):
     return next(item for item in WORKFLOW["jobs"][job]["steps"] if item.get("id") == step_id)
+
+
+# The freshness predicate (trigger_superseded/trigger_lagging derived from
+# t_num/t_attempt/t_concl vs. l_num/l_attempt/l_concl) cannot live in a
+# shared file: this is a reusable workflow, so production logic runs inline
+# in caller repos. Both call sites (triage's "triage" step, autofix's "pre"
+# step) instead wrap their copy in a matching
+# `# autopilot-freshness-predicate:begin/:end` marker pair, so it can be
+# extracted verbatim from each and compared for byte-equality.
+FRESHNESS_PREDICATE_PATTERN = re.compile(
+    r"# autopilot-freshness-predicate:begin\n(.*?)"
+    r"  # autopilot-freshness-predicate:end\n",
+    re.S,
+)
+
+
+def freshness_predicate_blocks():
+    """Extract the triage and autofix copies of the shared freshness
+    predicate. Each call site's `run:` script must contain the marker pair
+    exactly once; a missing or duplicated marker fails loudly here rather
+    than silently comparing the wrong (or no) text."""
+    triage_script = step("triage", "triage")["run"]
+    autofix_script = step("autofix", "pre")["run"]
+    triage_blocks = FRESHNESS_PREDICATE_PATTERN.findall(triage_script)
+    autofix_blocks = FRESHNESS_PREDICATE_PATTERN.findall(autofix_script)
+    assert len(triage_blocks) == 1, triage_script
+    assert len(autofix_blocks) == 1, autofix_script
+    return triage_blocks[0], autofix_blocks[0]
 
 
 def make_shell_harness(testcase, **config):

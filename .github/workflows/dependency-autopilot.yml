@@ -193,31 +193,43 @@ jobs:
           #                run's own live t_num/t_attempt/t_concl, exactly
           #                as before currency checking existed.
           trigger_superseded=0
-          if [ "$t_concl" != "$CI_CONCLUSION" ]; then
-            trigger_superseded=1
-            echo "::notice::triggering run $RUN_ID (workflow $t_wf, run $t_num attempt $t_attempt) is superseded: its live conclusion is now '$t_concl', not the triggering '$CI_CONCLUSION'; reconciling from the fresh inventory instead of the stale trigger conclusion, subject to the inventory's own freshness below."
-          fi
           retry_seconds="${AUTOPILOT_CURRENCY_RETRY_SECONDS:-5}"
           inventory_attempt=1
           trigger_lagging=1
           while [ "$inventory_attempt" -le 3 ]; do
             gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$pr_sha&event=pull_request&per_page=100" \
               --paginate --slurp > "$runs_file"
+            # Given t_wf/t_num/t_attempt/t_concl/CI_CONCLUSION and a freshly
+            # fetched runs_file, this derives trigger_superseded and
+            # trigger_lagging. Kept BYTE-IDENTICAL with autofix's own copy
+            # of the same predicate below — tests/test_dependency_autopilot.py's
+            # test_freshness_predicate_is_locked_between_triage_and_autofix
+            # extracts both copies verbatim and fails the suite the moment a
+            # future edit touches one site without the other.
+            # autopilot-freshness-predicate:begin
             latest=$(jq '[ .[] | .workflow_runs[] ] | group_by(.workflow_id) | map(max_by(.run_number))' "$runs_file")
             l_num=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | .run_number ] | first // empty' <<<"$latest")
             l_attempt=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | .run_attempt ] | first // empty' <<<"$latest")
             l_concl=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | (.conclusion // "") ] | first // empty' <<<"$latest")
             trigger_lagging=0
+            if [ "$t_concl" != "$CI_CONCLUSION" ]; then
+              trigger_superseded=1
+            fi
             if [ -z "$l_num" ]; then
               trigger_lagging=1
             elif [ "$l_num" -gt "$t_num" ]; then
               trigger_superseded=1
-              echo "::notice::triggering run $RUN_ID (workflow $t_wf, run $t_num attempt $t_attempt) is superseded: the latest run for that workflow at this head is now #$l_num; reconciling from the fresh inventory instead of the stale trigger conclusion."
             elif [ "$l_num" -lt "$t_num" ]; then
               trigger_lagging=1
             elif [ "$l_attempt" != "$t_attempt" ] || [ "$l_concl" != "$t_concl" ]; then
               trigger_lagging=1
-              echo "::notice::the run-list inventory for workflow $t_wf still shows run $t_num attempt ${l_attempt:-none} (concluded '${l_concl:-none}'), but the live run is now attempt $t_attempt (concluded '$t_concl'); a rerun can reuse the run number while incrementing the attempt, so a matching run_number alone does not prove this inventory entry is current."
+            fi
+            # autopilot-freshness-predicate:end
+            if [ "$trigger_superseded" = "1" ]; then
+              echo "::notice::triggering run $RUN_ID (workflow $t_wf, run $t_num attempt $t_attempt) is superseded: live conclusion is now '$t_concl' (triggering conclusion was '$CI_CONCLUSION'), and/or the latest known run for that workflow is #${l_num:-none}; reconciling from the fresh inventory instead of the stale trigger conclusion, subject to the inventory's own freshness below."
+            fi
+            if [ "$trigger_lagging" = "1" ]; then
+              echo "::notice::the run-list inventory for workflow $t_wf has not caught up with run $RUN_ID (its own run $t_num attempt $t_attempt, concluded '$t_concl'); latest known is run ${l_num:-none} attempt ${l_attempt:-none} (concluded '${l_concl:-none}'); a rerun can reuse the run number while incrementing the attempt, so a matching run_number alone does not prove this inventory entry is current."
             fi
             [ "$trigger_lagging" = "0" ] && break
             inventory_attempt=$((inventory_attempt + 1))
@@ -285,10 +297,11 @@ jobs:
           # logic. `ci_unresolved` is reserved for `still_owed`: an
           # ACTUALLY OBSERVED pending run or repair-set sibling, which is a
           # real future event with a real future owner (its own completion,
-          # or autofix). An exhausted-empty read has no such future event —
-          # treating it as ci_unresolved would strand the PR on the
-          # handoff's deliberate ci_unresolved no-op forever, since nothing
-          # is left to complete and re-trigger this workflow.
+          # or autofix). An exhausted-empty (or otherwise lagging) read of
+          # the LIST has no such future event by itself — treating it as
+          # ci_unresolved would strand the PR on the handoff's deliberate
+          # ci_unresolved no-op forever, since nothing is left to complete
+          # and re-trigger this workflow.
           still_owed=$(jq --argjson repair '["failure","timed_out","action_required","startup_failure"]' '
                     [ .[] | select(
                         .conclusion == null
@@ -296,6 +309,24 @@ jobs:
                       ) ] | length' <<<"$latest")
           unresolved=0
           [ "$still_owed" -gt 0 ] && unresolved=1
+          # But the list is not the only source of "actually observed". This
+          # invocation's own direct `gh run view` re-read (t_concl) is a
+          # SECOND, more authoritative source for this exact run: when it is
+          # itself a repair-set conclusion and the list has not yet caught
+          # up to confirm or refute it (trigger_lagging=1), that is not a
+          # guess — it is a directly observed repair-set completion whose
+          # own serialized dispatch is queued behind this very invocation in
+          # the same concurrency group and WILL call autofix. Treat it as
+          # still_owed too, so this reconciles to ci_unresolved instead of
+          # review_held and does not race that queued repair attempt by
+          # handing the PR to pro-review first (round-9's ci_unresolved
+          # reservation already covers "actually observed repair-set work";
+          # this only widens the accepted SOURCE of that observation).
+          if [ "$trigger_lagging" = "1" ]; then
+            case "$t_concl" in
+              failure | timed_out | action_required | startup_failure) unresolved=1 ;;
+            esac
+          fi
 
           # Refresh before classification and mutation. Compare only the stable
           # safety identity: unrelated labels/display metadata may change, while
@@ -507,28 +538,59 @@ jobs:
           # not caught up yet. Triage does not run for a repair-set
           # conclusion, so fetch the inventory fresh here too, retrying a
           # bounded number of times to let a lagging list catch up before
-          # treating currency as unprovable.
+          # treating currency as unprovable. A rerun REUSES the triggering
+          # run's run_number while incrementing run_attempt, so a
+          # run_number match alone does NOT prove currency: it can still
+          # expose an earlier attempt's conclusion under a matching
+          # run_number. Currency is bound to run_number AND attempt AND
+          # conclusion together, exactly as triage requires.
           t_wf=$(jq -r '.workflowDatabaseId' "$run_file")
           t_num=$(jq -r '.number' "$run_file")
           t_attempt=$(jq -r '.attempt' "$run_file")
           t_concl=$(jq -r '.conclusion // ""' "$run_file")
+          trigger_superseded=0
           retry_seconds="${AUTOPILOT_CURRENCY_RETRY_SECONDS:-5}"
-          currency="lagging"
           attempt=1
+          trigger_lagging=1
           while [ "$attempt" -le 3 ]; do
             gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$pr_sha&event=pull_request&per_page=100" \
               --paginate --slurp > "$runs_file"
+            # Given t_wf/t_num/t_attempt/t_concl/CI_CONCLUSION and a freshly
+            # fetched runs_file, this derives trigger_superseded and
+            # trigger_lagging. Kept BYTE-IDENTICAL with triage's own copy of
+            # the same predicate above — tests/test_dependency_autopilot.py's
+            # test_freshness_predicate_is_locked_between_triage_and_autofix
+            # extracts both copies verbatim and fails the suite the moment a
+            # future edit touches one site without the other.
+            # autopilot-freshness-predicate:begin
             latest=$(jq '[ .[] | .workflow_runs[] ] | group_by(.workflow_id) | map(max_by(.run_number))' "$runs_file")
             l_num=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | .run_number ] | first // empty' <<<"$latest")
-            if [ "$t_concl" != "$CI_CONCLUSION" ] || { [ -n "$l_num" ] && [ "$l_num" -gt "$t_num" ]; }; then
-              currency="superseded"; break
+            l_attempt=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | .run_attempt ] | first // empty' <<<"$latest")
+            l_concl=$(jq -r --argjson wf "$t_wf" '[ .[] | select(.workflow_id == $wf) | (.conclusion // "") ] | first // empty' <<<"$latest")
+            trigger_lagging=0
+            if [ "$t_concl" != "$CI_CONCLUSION" ]; then
+              trigger_superseded=1
             fi
-            if [ -n "$l_num" ] && [ "$l_num" -eq "$t_num" ]; then
-              currency="current"; break
+            if [ -z "$l_num" ]; then
+              trigger_lagging=1
+            elif [ "$l_num" -gt "$t_num" ]; then
+              trigger_superseded=1
+            elif [ "$l_num" -lt "$t_num" ]; then
+              trigger_lagging=1
+            elif [ "$l_attempt" != "$t_attempt" ] || [ "$l_concl" != "$t_concl" ]; then
+              trigger_lagging=1
             fi
+            # autopilot-freshness-predicate:end
+            [ "$trigger_lagging" = "0" ] && break
             attempt=$((attempt + 1))
             [ "$attempt" -le 3 ] && sleep "$retry_seconds"
           done
+          currency="lagging"
+          if [ "$trigger_superseded" = "1" ]; then
+            currency="superseded"
+          elif [ "$trigger_lagging" = "0" ]; then
+            currency="current"
+          fi
           # Fail CLOSED toward NOT repairing on every state but proven
           # current — running Codex, consuming the single repair attempt, or
           # pushing changes against a head that may already be green is the

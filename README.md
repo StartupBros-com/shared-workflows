@@ -122,8 +122,18 @@ expected, not evidence of a dependency-workflow outage.
   to `review_held`, not an eternal `ci_unresolved`.
 
   Reaching `unresolved` at all requires an *actually observed* pending run or
-  repair-set sibling in the freshly fetched inventory — never merely an
-  inventory that failed to prove itself current. The triggering run's own
+  repair-set sibling — never merely an inventory that failed to prove itself
+  current. "Actually observed" has two sources: a repair-set (or pending)
+  entry in the freshly fetched inventory, or this invocation's own direct
+  `gh run view` re-read of the triggering run itself, when that read is a
+  repair-set conclusion and the inventory has not yet caught up to confirm
+  or refute it. The second source matters because a success-triggered
+  invocation can observe, via its own re-read, that the same run is now on a
+  newer *failed* attempt: the inventory alone would still show the stale
+  success and reconcile to `review_held`, handing off to Pro review before
+  that failed attempt's own serialized callback gets to run autofix — the
+  directly observed failure is real, queued-but-not-yet-run repair work,
+  not a guess. The triggering run's own
   identity is re-bound to its live `run_number`, `run_attempt`, and
   `conclusion` together, not `run_number` alone: a rerun reuses the same
   `run_number` while incrementing the attempt, so a matching run_number can

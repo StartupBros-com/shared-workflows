@@ -154,6 +154,31 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('"failure"|"timed_out"|"action_required"|"startup_failure"', handoff_script)
         self.assertNotIn("no handoff path", handoff_script)
 
+    def test_freshness_predicate_is_locked_between_triage_and_autofix(self):
+        # See autopilot_harness.freshness_predicate_blocks: this is the
+        # automated guard replacing "a comment asking humans to remember"
+        # for a predicate that (being reusable-workflow YAML) cannot be
+        # factored into one shared file.
+        triage_block, autofix_block = autopilot_harness.freshness_predicate_blocks()
+        # Non-trivial: guards against a marker pair wrapping an empty or
+        # near-empty span, which would make the equality assertion vacuous.
+        self.assertIn("trigger_superseded", triage_block)
+        self.assertIn("trigger_lagging", triage_block)
+        self.assertIn("l_attempt", triage_block)
+        self.assertIn("l_concl", triage_block)
+        self.assertEqual(triage_block, autofix_block)
+
+    def test_freshness_predicate_lockstep_guard_fails_on_drift(self):
+        # Proves the guard above is discriminating, not vacuously true: a
+        # one-sided edit to either copy (here, autofix's) must make the
+        # byte-equality assertion fail, exactly as it would on a real
+        # future drift between the two call sites.
+        triage_block, autofix_block = autopilot_harness.freshness_predicate_blocks()
+        drifted_autofix_block = autofix_block.replace(
+            'elif [ "$l_attempt" != "$t_attempt" ]', 'elif [ "$l_attempt" = "$t_attempt" ]', 1)
+        self.assertNotEqual(triage_block, drifted_autofix_block)
+        self.assertNotEqual(autofix_block, drifted_autofix_block)
+
     def test_success_skipped_and_neutral_share_the_reconciliation_path(self):
         cases = (
             ("skipped", "chore(deps): bump pkg from 1.0.0 to 1.0.1", "green_safe"),
@@ -603,6 +628,40 @@ class WorkflowTests(unittest.TestCase):
         self.success(harness.run("triage", "triage"))
         self.assertEqual(harness.outputs()["outcome"], "ci_unresolved")
 
+    def test_directly_observed_newer_failed_attempt_stays_ci_unresolved(self):
+        # Round-10 P1 (FINDING B): this invocation was triggered by a
+        # success completion of attempt 1, but by the time it runs, a
+        # rerun's attempt 2 has already concluded 'failure' — this job's own
+        # direct `gh run view` re-read proves it. The run-list inventory has
+        # not caught up (still shows attempt 1's success under the same
+        # run_number), so trigger_lagging correctly blocks green. But that
+        # directly observed failure IS actually observed repair-set work: a
+        # real future event (that failed attempt's own serialized callback)
+        # is queued behind this invocation and will call autofix. Routing
+        # this to review_held instead of ci_unresolved would let handoff
+        # apply pro-review, and admission treats an existing pro-review
+        # label as another owner — starving the queued repair attempt and
+        # breaking repair-before-review ordering.
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            run=RUN | {"workflowDatabaseId": 1, "number": 11, "attempt": 2, "conclusion": "failure"},
+            runs={"workflow_runs": [
+                {"workflow_id": 1, "run_number": 11, "run_attempt": 1, "conclusion": "success"},
+            ]},
+        )
+        self.success(harness.run(
+            "triage", "triage", CI_CONCLUSION="success", AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+        ))
+        outputs = harness.outputs()
+        self.assertEqual(outputs["outcome"], "ci_unresolved")
+        self.assertNotEqual(outputs["outcome"], "review_held")
+        self.success(self.handoff(
+            harness, CI_CONCLUSION="success",
+            TRIAGE_OUTCOME=outputs["outcome"], TRIAGE_NUMBER=outputs["number"],
+            TRIAGE_TRIGGER_SHA=outputs["trigger_sha"],
+        ))
+        self.assertFalse(any(c[:3] == ["gh", "pr", "edit"] and "pro-review" in c for c in harness.calls()))
+
     def test_forced_termination_with_bound_metadata_falls_back_to_failed_execution(self):
         harness = self.harness()
         self.success(self.red_handoff(harness, "", AUTOFIX_RESULT="failure",
@@ -792,6 +851,48 @@ class WorkflowTests(unittest.TestCase):
             runs={"workflow_runs": [{"workflow_id": 1, "run_number": 3, "conclusion": "failure"}]},
         )
         self.success(harness.run("autofix", "pre", CI_CONCLUSION="failure"))
+        self.assertEqual(harness.outputs()["outcome"], "admitted")
+        self.assertEqual(harness.outputs()["ok"], "1")
+
+    def test_autofix_same_run_number_newer_attempt_does_not_repair(self):
+        # Round-10 P1 (FINDING A): a rerun reuses the triggering run's
+        # run_number while incrementing run_attempt. The live read is now
+        # attempt 2, but the run-list inventory still shows attempt 1's
+        # conclusion under the SAME run_number — round 9's run_number-only
+        # check (autofix's copy) cannot see this and would wrongly call it
+        # current, consuming the once-only repair attempt against a head
+        # whose currency is unproven. Must stay indeterminate: no Codex, no
+        # repair attempt consumed.
+        harness = self.harness(
+            run=RUN | {"workflowDatabaseId": 1, "number": 11, "attempt": 2, "conclusion": "failure"},
+            runs={"workflow_runs": [
+                {"workflow_id": 1, "run_number": 11, "run_attempt": 1, "conclusion": "success"},
+            ]},
+        )
+        self.success(harness.run(
+            "autofix", "pre", CI_CONCLUSION="failure", AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+        ))
+        self.assertEqual(harness.outputs()["outcome"], "currency_indeterminate")
+        self.assertEqual(harness.outputs()["ok"], "0")
+        self.assertEqual(self.mutation_calls(harness), [])
+        self.assertFalse(any(c[0] == "codex" for c in harness.calls()))
+
+    def test_autofix_fully_matching_number_attempt_and_conclusion_still_repairs(self):
+        # The happy path is unchanged: when run_number, run_attempt, and
+        # conclusion in the inventory all agree with the live trigger read
+        # (here at a non-default attempt, so the fix cannot be satisfied by
+        # the fake CLI's attempt-1 default alone), currency is proven and
+        # admission still succeeds exactly as before attempt/conclusion
+        # binding was added to autofix.
+        harness = self.harness(
+            run=RUN | {"workflowDatabaseId": 1, "number": 11, "attempt": 2, "conclusion": "failure"},
+            runs={"workflow_runs": [
+                {"workflow_id": 1, "run_number": 11, "run_attempt": 2, "conclusion": "failure"},
+            ]},
+        )
+        self.success(harness.run(
+            "autofix", "pre", CI_CONCLUSION="failure", AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+        ))
         self.assertEqual(harness.outputs()["outcome"], "admitted")
         self.assertEqual(harness.outputs()["ok"], "1")
 
