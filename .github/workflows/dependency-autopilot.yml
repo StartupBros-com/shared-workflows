@@ -194,7 +194,7 @@ jobs:
           [ "$pending_reviews" = "0" ] || stop existing_owner "PR #$num has a pending review request; leaving it to that owner."
 
           gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
-            --json event,headSha,url,conclusion,number,attempt,workflowDatabaseId > "$run_file"
+            --json event,headSha,url,conclusion,number,attempt,workflowDatabaseId,status > "$run_file"
           run_event=$(jq -r '.event // ""' "$run_file")
           run_sha=$(jq -r '.headSha // ""' "$run_file")
           [ "$run_event" = "pull_request" ] || stop stale_rejected "run $RUN_ID is not pull_request provenance; skipping."
@@ -251,6 +251,7 @@ jobs:
           t_num=$(jq -r '.number' "$run_file")
           t_attempt=$(jq -r '.attempt' "$run_file")
           t_concl=$(jq -r '.conclusion // ""' "$run_file")
+          t_status=$(jq -r '.status // ""' "$run_file")
           # The run-list API is eventually consistent and can lag behind
           # this direct `gh run view` read, so a run_number match alone does
           # NOT prove currency: a rerun REUSES the same run_number while
@@ -381,6 +382,62 @@ jobs:
             inventory_attempt=$((inventory_attempt + 1))
             [ "$inventory_attempt" -le 3 ] && sleep "$retry_seconds"
           done
+
+          # Round-13 P1 (FINDING A, merge safety): the loop above binds
+          # ONLY this invocation's own trigger (workflow $t_wf) to a live
+          # re-read before trusting its list entry. Every OTHER selected
+          # entry in $latest can be just as stale — a rerun of a SIBLING
+          # workflow reuses ITS OWN run_number too while incrementing ITS
+          # OWN run_attempt, and the run-list read above is the only
+          # source ever consulted for a sibling. With the trigger itself
+          # current, the loop above exits on the FIRST attempt without
+          # ever giving a lagging SIBLING a chance to be caught: a stale
+          # earlier-attempt success can ride straight through into
+          # successes/bad below, and this reusable workflow's `automerge`
+          # mode would then merge on CI the sibling never actually passed.
+          # This is the same shape as rounds 10 and 12's trigger-only
+          # freshness gaps, generalized to the whole selection: before
+          # counting ANY selected run toward successes/bad, re-read that
+          # run by id and require its live run_attempt, status, and
+          # conclusion to match the inventory entry. The trigger's own
+          # entry needs no second fetch here — trigger_lagging above
+          # already proves (or disproves) its currency from an already
+          # -fetched direct read (trigger_lagging, plus FINDING B's
+          # t_status widening just above), which already gives its OWN
+          # entry a deliberately different, more nuanced "unproven"
+          # handling than a plain null would (a present-but-stale trigger
+          # entry must NOT itself flip unresolved — only a directly
+          # observed repair-set or still-running t_concl may, exactly as
+          # coded above); this loop leaves that entry alone and applies
+          # the SAME "distrust a disagreeing live read" principle to every
+          # OTHER selected entry, the part of the selection no existing
+          # mechanism ever re-validated. One bounded read per watched
+          # sibling workflow, not retried here — the retry loop above
+          # already gave a merely-slow LIST a chance to catch up; retrying
+          # this direct per-run read too would multiply cost without
+          # closing a gap a single authoritative read does not already
+          # close, and could reintroduce the staleness this check exists
+          # to remove.
+          verified="[]"
+          while IFS= read -r sib; do
+            sib_wf=$(jq -r '.workflow_id' <<<"$sib")
+            if [ "$sib_wf" != "$t_wf" ]; then
+              sib_id=$(jq -r '.id' <<<"$sib")
+              sib_attempt=$(jq -r '.run_attempt // 1' <<<"$sib")
+              sib_concl=$(jq -r '.conclusion // ""' <<<"$sib")
+              sib_live=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$sib_id")
+              sib_live_status=$(jq -r '.status // ""' <<<"$sib_live")
+              sib_live_attempt=$(jq -r '.run_attempt // empty' <<<"$sib_live")
+              sib_live_concl=$(jq -r '.conclusion // ""' <<<"$sib_live")
+              if [ "$sib_live_status" != "completed" ] || [ "$sib_live_attempt" != "$sib_attempt" ] || [ "$sib_live_concl" != "$sib_concl" ]; then
+                echo "::notice::sibling workflow $sib_wf's run-list entry (run $sib_id, attempt $sib_attempt, concluded '$sib_concl') does not match a fresh read of that same run (status '${sib_live_status:-none}', attempt '${sib_live_attempt:-none}', concluded '${sib_live_concl:-none}'); treating it as unresolved rather than trusting the list."
+                sib=$(jq '.conclusion = null' <<<"$sib")
+              fi
+            fi
+            verified=$(jq --argjson e "$sib" '. + [$e]' <<<"$verified")
+          done < <(jq -c '.[]' <<<"$latest")
+          latest="$verified"
+
           total=$(jq 'length' <<<"$latest")
           successes=$(jq '[ .[] | select(.conclusion == "success") ] | length' <<<"$latest")
           bad=$(jq '[ .[] | (.conclusion // "pending") ]
@@ -468,9 +525,30 @@ jobs:
           # handing the PR to pro-review first (round-9's ci_unresolved
           # reservation already covers "actually observed repair-set work";
           # this only widens the accepted SOURCE of that observation).
+          #
+          # Round-13 P2 (FINDING B): a repair-set t_concl is not the only
+          # directly observed "real future event still owed" this exact
+          # re-read can prove. When trigger_lagging is set because the
+          # trigger's own run has moved to a NEWER attempt that has not
+          # completed yet, t_concl reads as empty (no conclusion yet) —
+          # the same shape the case above falls through on by default. But
+          # that empty conclusion is not "unknown"; t_status directly
+          # proves this exact attempt is still in flight, and its eventual
+          # completion is a real, already-scheduled future event (queued
+          # behind this invocation in the same concurrency group), exactly
+          # like a directly observed repair-set conclusion. Treat it the
+          # same way: unresolved, not review_held, so handoff does not
+          # apply pro-review and starve that attempt's own eventual
+          # completion (including a later failure) of its ordinary
+          # routing. A trigger conclusion that IS a completed, non-repair
+          # terminal value (success/skipped/neutral/cancelled/stale/...)
+          # still falls through untouched — t_status is "completed" for
+          # all of those, so only a genuinely still-running attempt
+          # matches here.
           if [ "$trigger_lagging" = "1" ]; then
             case "$t_concl" in
               failure | timed_out | action_required | startup_failure) unresolved=1 ;;
+              *) [ "$t_status" = "completed" ] || unresolved=1 ;;
             esac
           fi
 

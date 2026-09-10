@@ -172,21 +172,33 @@ job for a fork's event.
   current. "Actually observed" has two sources: a repair-set (or pending)
   entry in the freshly fetched inventory, or this invocation's own direct
   `gh run view` re-read of the triggering run itself, when that read is a
-  repair-set conclusion and the inventory has not yet caught up to confirm
-  or refute it. The second source matters because a success-triggered
-  invocation can observe, via its own re-read, that the same run is now on a
-  newer *failed* attempt: the inventory alone would still show the stale
-  success and reconcile to `review_held`, handing off to Pro review before
-  that failed attempt's own serialized callback gets to run autofix — the
-  directly observed failure is real, queued-but-not-yet-run repair work,
-  not a guess. The triggering run's own
-  identity is re-bound to its live `run_number`, `run_attempt`, and
-  `conclusion` together, not `run_number` alone: a rerun reuses the same
-  `run_number` while incrementing the attempt, so a matching run_number can
-  still expose a stale earlier attempt's conclusion under an
-  eventually-consistent list. Such a mismatch is treated as lagging, forcing
-  the head non-green so a stale success can never clear the safe-tier merge
-  gate. An empty or still-lagging inventory for the triggering workflow is
+  repair-set conclusion, or a live attempt that has not yet completed, and
+  the inventory has not yet caught up to confirm or refute it. The second
+  source matters because a success-triggered invocation can observe, via its
+  own re-read, that the same run is now on a newer *failed*, or still
+  *pending*, attempt: the inventory alone would still show the stale success
+  and reconcile to `review_held`, handing off to Pro review before that
+  attempt's own serialized callback gets to run autofix (for a failed
+  attempt) or completes at all (for a pending one) — the directly observed
+  live state is real, queued-but-not-yet-run repair work or a run still in
+  flight, not a guess. The triggering run's own identity is re-bound to its
+  live `run_number`, `run_attempt`, and `conclusion` together, not
+  `run_number` alone: a rerun reuses the same `run_number` while
+  incrementing the attempt, so a matching run_number can still expose a
+  stale earlier attempt's conclusion under an eventually-consistent list.
+  Such a mismatch is treated as lagging, forcing the head non-green so a
+  stale success can never clear the safe-tier merge gate. The same live
+  re-read applies uniformly to every other watched-workflow run selected
+  from the inventory, not only the trigger: before any selected run counts
+  toward a success or a repair-set failure, it is re-read by its run ID and
+  its live `run_attempt`, `status`, and `conclusion` must match the
+  inventory entry exactly; a mismatch, or a live attempt that has not yet
+  completed, makes that inventory entry non-authoritative on its own and it
+  is treated as unresolved rather than trusted — this closes the same
+  reused-`run_number` staleness for a sibling's rerun that the trigger's own
+  rebinding already closed for itself, without replacing the trigger's more
+  nuanced handling (which also reacts to a *directly* observed pending or
+  repair-set conclusion, not just a list mismatch). An empty or still-lagging inventory for the triggering workflow is
   retried a bounded number of times (`AUTOPILOT_CURRENCY_RETRY_SECONDS`, the
   same knob autofix's own currency retry uses); if it is still empty or still
   behind after the bound, that is not treated as an owed future event either

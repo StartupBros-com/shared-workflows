@@ -676,6 +676,78 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(outputs["outcome"], "green_safe")
         self.assertTrue(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
 
+    def test_sibling_rerun_with_a_live_failing_attempt_does_not_merge(self):
+        # Round-13 P1 (FINDING A): the trigger's own workflow (1) is fully
+        # current, so the retry loop above exits immediately on the FIRST
+        # attempt — it never gives a SIBLING's own eventually-consistent
+        # list entry a chance to catch up, because that loop only re-reads
+        # the trigger. Sibling workflow 2's inventory entry still shows an
+        # older attempt's "success", but a fresh single-run read of that
+        # exact run (by id) shows a NEWER attempt is now live and FAILING.
+        # Trusting the stale list entry here would let a safe-tier PR merge
+        # on CI the sibling never actually passed.
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            run=RUN | {"workflowDatabaseId": 1, "number": 1, "attempt": 1, "conclusion": "success"},
+            runs={"workflow_runs": [
+                {"workflow_id": 1, "run_number": 1, "run_attempt": 1, "conclusion": "success"},
+                {"workflow_id": 2, "run_number": 5, "run_attempt": 1, "conclusion": "success", "id": 555},
+            ]},
+            live_runs={"555": {"attempt": 2, "status": "completed", "conclusion": "failure"}},
+        )
+        self.success(harness.run(
+            "triage", "triage", CI_CONCLUSION="success", MODE="automerge",
+            AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+        ))
+        outputs = harness.outputs()
+        self.assertNotEqual(outputs["outcome"], "green_safe")
+        self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+
+    def test_sibling_rerun_with_a_live_pending_attempt_stays_ci_unresolved(self):
+        # Round-13 P1 (FINDING A), pending variant: same stale-success list
+        # entry for sibling workflow 2, but its fresh single-run read shows
+        # the newer attempt has NOT completed yet — a real future event
+        # (that attempt's own eventual conclusion) is still owed, so this
+        # must land on ci_unresolved, not review_held or green_safe.
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            run=RUN | {"workflowDatabaseId": 1, "number": 1, "attempt": 1, "conclusion": "success"},
+            runs={"workflow_runs": [
+                {"workflow_id": 1, "run_number": 1, "run_attempt": 1, "conclusion": "success"},
+                {"workflow_id": 2, "run_number": 5, "run_attempt": 1, "conclusion": "success", "id": 555},
+            ]},
+            live_runs={"555": {"attempt": 2, "status": "in_progress", "conclusion": None}},
+        )
+        self.success(harness.run(
+            "triage", "triage", CI_CONCLUSION="success", MODE="automerge",
+            AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+        ))
+        outputs = harness.outputs()
+        self.assertEqual(outputs["outcome"], "ci_unresolved")
+        self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+
+    def test_all_siblings_live_matching_inventory_classifies_as_today(self):
+        # Round-13 P1 control: every selected entry's fresh single-run read
+        # agrees with its list entry exactly (the ordinary case — no rerun
+        # has happened for anything), so the new per-sibling freshness
+        # check must be a no-op and the green/automerge path is unchanged.
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            run=RUN | {"workflowDatabaseId": 1, "number": 1, "attempt": 1, "conclusion": "success"},
+            runs={"workflow_runs": [
+                {"workflow_id": 1, "run_number": 1, "run_attempt": 1, "conclusion": "success"},
+                {"workflow_id": 2, "run_number": 5, "run_attempt": 1, "conclusion": "success", "id": 555},
+                {"workflow_id": 3, "run_number": 2, "run_attempt": 1, "conclusion": "skipped", "id": 556},
+            ]},
+        )
+        self.success(harness.run(
+            "triage", "triage", CI_CONCLUSION="success", MODE="automerge",
+            AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+        ))
+        outputs = harness.outputs()
+        self.assertEqual(outputs["outcome"], "green_safe")
+        self.assertTrue(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+
     def test_non_success_sibling_reconciles_to_review_held_instead_of_stranding_the_hold(self):
         # A prior event would have held this as ci_unresolved awaiting the
         # sibling; once the sibling's own non-repair terminal conclusion is
@@ -758,6 +830,42 @@ class WorkflowTests(unittest.TestCase):
         harness = self.harness(
             prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
             run=RUN | {"workflowDatabaseId": 1, "number": 11, "attempt": 2, "conclusion": "failure"},
+            runs={"workflow_runs": [
+                {"workflow_id": 1, "run_number": 11, "run_attempt": 1, "conclusion": "success"},
+            ]},
+        )
+        self.success(harness.run(
+            "triage", "triage", CI_CONCLUSION="success", AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
+        ))
+        outputs = harness.outputs()
+        self.assertEqual(outputs["outcome"], "ci_unresolved")
+        self.assertNotEqual(outputs["outcome"], "review_held")
+        self.success(self.handoff(
+            harness, CI_CONCLUSION="success",
+            TRIAGE_OUTCOME=outputs["outcome"], TRIAGE_NUMBER=outputs["number"],
+            TRIAGE_TRIGGER_SHA=outputs["trigger_sha"],
+        ))
+        self.assertFalse(any(c[:3] == ["gh", "pr", "edit"] and "pro-review" in c for c in harness.calls()))
+
+    def test_directly_observed_newer_pending_attempt_stays_ci_unresolved(self):
+        # Round-13 P2 (FINDING B): this invocation was triggered by a
+        # success completion of attempt 1, but by the time it runs, a
+        # rerun's attempt 2 is already live and has NOT completed — this
+        # job's own direct `gh run view` re-read shows an empty conclusion
+        # and a non-"completed" status. The run-list inventory has not
+        # caught up (still shows attempt 1's success under the same
+        # run_number), so trigger_lagging correctly blocks green. Unlike
+        # the failed-attempt sibling case, this directly observed PENDING
+        # attempt owes its OWN eventual completion — routing this to
+        # review_held would let handoff apply pro-review, and admission
+        # treats an existing pro-review label as another owner, starving
+        # the pending attempt's eventual failure of its autofix turn.
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            run=RUN | {
+                "workflowDatabaseId": 1, "number": 11, "attempt": 2,
+                "conclusion": None, "status": "in_progress",
+            },
             runs={"workflow_runs": [
                 {"workflow_id": 1, "run_number": 11, "run_attempt": 1, "conclusion": "success"},
             ]},

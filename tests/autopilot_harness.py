@@ -357,6 +357,14 @@ if name == "gh":
         run_cfg.setdefault("workflowDatabaseId", 1)
         run_cfg.setdefault("number", 1)
         run_cfg.setdefault("attempt", 1)
+        # Round-13 P2 (FINDING B): a test simulating a directly observed
+        # PENDING rerun sets conclusion=None explicitly (present, not
+        # absent, so the setdefault above leaves it alone) without also
+        # having to spell out status — a completed run always carries a
+        # conclusion, so status defaults from whichever this run's own
+        # conclusion is; only a test constructing the pending case on
+        # purpose ever needs to override status too.
+        run_cfg.setdefault("status", "completed" if run_cfg.get("conclusion") is not None else "in_progress")
         print(json.dumps(run_cfg))
     elif args[0] == "api":
         endpoint = args[1]
@@ -437,12 +445,51 @@ if name == "gh":
             # (nearly every pre-existing one) admits trivially by
             # construction; a test exercising the gate itself overrides
             # `run["head_repository"]`/`run["head_branch"]` to disagree.
+            #
+            # Round-13 P1 (FINDING A): the SAME single-run endpoint is now
+            # also the sibling-freshness re-read: production fetches it by
+            # each selected inventory entry's own `.id`, not just RUN_ID.
+            # Look the queried id up among the run-list fixtures (applying
+            # the SAME `id` default the list branch below uses, since each
+            # `gh` invocation is a separate process — nothing set on an
+            # entry by a prior call persists here) and, when found, answer
+            # from that entry's own fields by default, so an unrelated
+            # test (nearly every pre-existing one) gets a sibling that
+            # trivially matches its list entry live, by construction. A
+            # test exercising the gate itself overrides `live_runs[id]`
+            # (status/attempt/conclusion) to disagree on purpose. A
+            # queried id that matches no list entry (RUN_ID, in nearly
+            # every test) falls back to the pre-existing `run`-keyed
+            # provenance-only response untouched.
+            queried_id = endpoint.rsplit("/", 1)[-1]
             run_cfg = config.get("run", {})
             default_repo = {"full_name": os.environ.get("GITHUB_REPOSITORY", "")}
-            print(json.dumps({
-                "head_repository": run_cfg.get("head_repository", default_repo),
-                "head_branch": run_cfg.get("head_branch", os.environ.get("BRANCH", "")),
-            }))
+            match = None
+            for page in config.get("run_pages", [config.get("runs", {"workflow_runs": []})]):
+                for entry in page.get("workflow_runs", []):
+                    entry.setdefault("run_attempt", 1)
+                    candidate_id = entry.get("id", entry["workflow_id"] * 1_000_000 + entry["run_number"])
+                    if str(candidate_id) == queried_id:
+                        match = entry
+                        break
+                if match:
+                    break
+            if match is None:
+                print(json.dumps({
+                    "head_repository": run_cfg.get("head_repository", default_repo),
+                    "head_branch": run_cfg.get("head_branch", os.environ.get("BRANCH", "")),
+                }))
+            else:
+                override = config.get("live_runs", {}).get(queried_id, {})
+                live_conclusion = override.get("conclusion", match.get("conclusion"))
+                default_status = "completed" if live_conclusion is not None else "in_progress"
+                print(json.dumps({
+                    "head_repository": override.get("head_repository", match.get("head_repository", default_repo)),
+                    "head_branch": override.get("head_branch", match.get("head_branch", os.environ.get("BRANCH", ""))),
+                    "status": override.get("status", default_status),
+                    "run_attempt": override.get("attempt", match.get("run_attempt", 1)),
+                    "conclusion": live_conclusion,
+                }))
         else:
             default_runs = {"workflow_runs": [
                 {"workflow_id": 1, "run_number": 1, "run_attempt": 1, "conclusion": "success"},
@@ -463,6 +510,15 @@ if name == "gh":
                     entry.setdefault("head_repository", {"full_name": os.environ.get("GITHUB_REPOSITORY", "")})
                     entry.setdefault("head_branch", os.environ.get("BRANCH", ""))
                     entry.setdefault("pull_requests", [])
+                    # Round-13 P1 (FINDING A): production re-reads each
+                    # selected entry by `.id` (the single-run endpoint
+                    # above), so every entry needs one — a real run's `id`
+                    # is stable across a rerun's attempts (only
+                    # `run_attempt`/`conclusion` change), so the default is
+                    # derived from workflow_id+run_number only, matching
+                    # the lookup the single-run branch above recomputes
+                    # independently for the same fixture.
+                    entry.setdefault("id", entry["workflow_id"] * 1_000_000 + entry["run_number"])
             if "--slurp" in args:
                 print(json.dumps(pages))
             else:
