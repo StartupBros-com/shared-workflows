@@ -4,27 +4,82 @@ Org-shared **reusable GitHub Actions workflows** for StartupBros-com.
 
 ## `dependency-autopilot.yml`
 
-A centralized self-healing dependency loop. Each repo adds a thin stub that calls
-it on `workflow_run`; all the logic lives here so it's fixed in one place.
+A shared dependency workflow, called after a repository's PR CI finishes:
 
+The space of run conclusions is exhaustively **partitioned into two routes, not
+enumerated as a list of known values**: a tightly-scoped REPAIR set, and
+everything else, which reconciles. GitHub can add new conclusion values at any
+time (`stale` is a real example); because "everything else" is defined as the
+negation of the repair set rather than a second positive list, no value —
+known today or added later — can fall through to a silent no-op.
+
+```text
+Dependabot / Renovate PR -> CI completes
+  REPAIR (failure, timed_out, action_required, startup_failure) -> bounded
+      application-code repair, unless the PR already carries
+      `autopilot:autofixed` (one repair attempt only) -> reconciles straight to
+      the terminal handoff instead
+    pushed -> hold for review before publishing, then skip the handoff for this
+      SHA; the pushed head re-fires its own CI, and that completion (forced to
+      tier=review by the `autopilot:autofixed` label) selects the next owner
+    no changes / unavailable credentials / failed execution / already-repaired /
+      currency-indeterminate -> hand off the unchanged PR only if its identity
+      and source CI can be revalidated, AND only once the same live sibling
+      reconciliation used below (a sibling still pending, or still owed its
+      own repair-set completion's repair attempt) has cleared for this head —
+      otherwise defer, the same way the reconcile route does, so a queued
+      sibling failure still gets its own repair turn instead of losing it to
+      this unchanged outcome's ownership claim
+  RECONCILE (everything not in the repair set — success, skipped, neutral,
+      cancelled, stale, or any future conclusion) -> reconcile the latest
+      watched-workflow inventory. Only a triggering conclusion that is
+      literally success, skipped, or neutral can ever count as success
+      evidence; every other value in this route (cancelled, stale, unknown)
+      is forced to tier=review and can only reach review_held or
+      ci_unresolved, never green_safe or a merge.
+    a run for this head is still genuinely pending (no conclusion yet), or a
+      sibling's own conclusion is itself in the repair set (its own event
+      still owes a repair attempt) -> keep the conservative hold; defer
+      handoff so review does not race that repair, for as long as that
+      conclusion stays in the repair set — no time bound (see Known
+      boundary below for the caller-side sweep this still needs)
+    all accepted + at least one success + safe -> existing ready queue (or
+      merge when caller selects automerge)
+    all accepted + held, OR a fully terminal inventory with zero genuine
+      successes (nothing pending, nothing still owed a repair attempt) ->
+      existing pro-review daemon; a terminal but all-bad inventory is never
+      stuck waiting on an event that already happened
 ```
-Dependabot opens a PR -> repo CI runs ->
-  green -> auto-merge   (genuine same-repo Dependabot PR, whole rollup green, safe bump)
-  red   -> Codex reads the failed logs, pushes the minimal code fix, CI re-runs
-```
 
-### Add it to a repo
+The workflow serializes all producer and handoff jobs for a caller's PR branch.
+Its workflow-level `queue: max` retains up to 100 pending runs and starts them FIFO
+by when they enter the queue, instead of allowing a late stale event to replace a
+pending current-head run. The handoff waits for both producer jobs to finish;
+labeling at red-path admission would race the repair worker. It covers held green
+PRs as well as unresolved red PRs without adding another reviewer or enrolling
+each repository in a new queue.
 
-1. Commit a `.github/dependabot.yml` (the "opener").
-2. Commit `.github/workflows/dependency-autopilot.yml` (the stub) — set
-   `workflows:` to **every** PR-triggered CI workflow `name:` in that repo, and
-   `ecosystem:` to `pnpm` | `npm` | `pip`:
+### Existing callers
+
+The `ci_conclusion`, `pr_branch`, `ci_run_id`, `ecosystem`, `mode`, and `runner`
+inputs are unchanged. `mode` defaults to **queue**, not automerge. Existing callers
+pinned to an older shared-workflows commit do **not** acquire this behavior until
+that pin is deliberately updated to a reviewed commit.
+
+A caller filters to dependency-bot PR events and passes the original CI run.
+Its `workflows:` list **must name every PR-triggered CI workflow**, not only the
+primary workflow: a sibling still genuinely pending, or a sibling whose own
+conclusion is in the repair set (it still owes its own repair attempt), is
+deliberately deferred until that sibling's watched completion event arrives.
+Repair-set completions run repair; every other completion — including any
+conclusion not named above — runs reconciliation. An incomplete list cannot
+promise a callback or safe repair-before-review ordering.
 
 ```yaml
 name: Dependency Autopilot
 on:
   workflow_run:
-    workflows: ["CI"]          # <- this repo's PR CI workflow name(s)
+    workflows: ["CI", "Other PR checks"] # list EVERY PR-triggered CI workflow name
     types: [completed]
 permissions:
   contents: write
@@ -34,21 +89,276 @@ jobs:
   autopilot:
     if: >-
       github.event.workflow_run.event == 'pull_request' &&
-      startsWith(github.event.workflow_run.head_branch, 'dependabot/')
-    uses: StartupBros-com/shared-workflows/.github/workflows/dependency-autopilot.yml@main
+      (startsWith(github.event.workflow_run.head_branch, 'dependabot/') ||
+       startsWith(github.event.workflow_run.head_branch, 'renovate/'))
+    uses: StartupBros-com/shared-workflows/.github/workflows/dependency-autopilot.yml@<reviewed-commit-sha>
     with:
       ci_conclusion: ${{ github.event.workflow_run.conclusion }}
-      pr_branch:     ${{ github.event.workflow_run.head_branch }}
-      ci_run_id:     ${{ github.event.workflow_run.id }}
-      ecosystem:     pnpm
-    secrets: inherit
+      pr_branch: ${{ github.event.workflow_run.head_branch }}
+      ci_run_id: ${{ github.event.workflow_run.id }}
+      ecosystem: pnpm
+    secrets:
+      APP_ID: ${{ secrets.APP_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+      CODEX_AUTH: ${{ secrets.CODEX_AUTH }}
 ```
 
-### Notes
+Use an existing approved runner through `runner` where required. The handoff uses
+that same runner choice. A skipped caller on an unrelated main-branch run is
+expected, not evidence of a dependency-workflow outage.
 
-- **Auto-merge needs no secret** — it runs on the default `GITHUB_TOKEN`.
-- **Auto-fix** needs `CODEX_AUTH` + a push token (`CI_BOT_PAT`, or a GitHub App
-  token). Where those aren't inherited (e.g. public repos with org secrets scoped
-  to private), the fix path skips cleanly and auto-merge still runs.
-- The merge path enforces `author == dependabot[bot]` and rejects fork PRs, so it
-  is safe to call from public repositories.
+### Caller responsibility: reject cross-repository `workflow_run` events first
+
+This reusable workflow confirms, on every path that consumes the triggering
+run (`ci_run_id`), that the run's own `head_repository.full_name` matches
+`github.repository` and its `head_branch` matches the queried branch, before
+treating that run as CI provenance for a PR — a public fork can push the
+IDENTICAL dependency-bump commit on a same-named branch (e.g.
+`dependabot/npm/pkg-2.0.0`), giving its own `pull_request` run the SAME head
+SHA as the legitimate PR while `head_repository` differs, so head-SHA
+equality alone is not provenance. That check happens **inside** this
+workflow, after `secrets:` has already been passed to it by the caller's
+`workflow_run` job.
+
+**This reusable workflow cannot enforce anything upstream of its own
+invocation.** By the time its `if:` condition or first step runs, the
+caller's job has already evaluated, and any `secrets:` block it passed
+(`APP_PRIVATE_KEY`, `CODEX_AUTH`) has already been made available to that
+job's runner. A `workflow_run` event fires for runs from forks too — GitHub
+grants no repository-identity filtering on the trigger itself — so a caller
+whose `if:` condition only checks `event` and `head_branch` (as the example
+above does) invokes this reusable workflow, and exposes those secrets to its
+job environment, for a fork-originated run at the same predictable branch
+name. This reusable workflow's internal admission gate stops that run from
+being treated as provenance before any privileged action (Codex invocation,
+credential minting, merge, push) — but the secrets have already reached a
+job triggered by an event describing a fork's run before that gate runs.
+Defence in depth requires the caller to reject non-same-repository
+`workflow_run` events in its OWN `if:` condition, before this reusable
+workflow — and therefore before its `secrets:` — is ever invoked:
+
+```yaml
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (startsWith(github.event.workflow_run.head_branch, 'dependabot/') ||
+       startsWith(github.event.workflow_run.head_branch, 'renovate/'))
+```
+
+Add the `head_repository.full_name == github.repository` clause to every
+caller's `if:` condition. This reusable workflow's own admission gate stays
+as a second, independent layer — it fails closed (does not admit) whenever
+the run's repository or branch cannot be positively confirmed via the REST
+`actions/runs/{run_id}` endpoint, including when that fetch itself fails —
+but it cannot retroactively un-expose secrets a caller already handed to a
+job for a fork's event.
+
+### Outcomes and ownership
+
+- **Safe green:** retains the existing `autopilot:ready` queue. It does not gain an
+  expensive Pro review merely because this integration exists. `mode: automerge`
+  retains the existing merge path, bound to the classified head SHA.
+- **CI unresolved:** retains the conservative `autopilot:review` hold but does not
+  request Pro review. `unresolved` means a real future event is still owed for
+  this head: a run with no conclusion yet, or a run whose conclusion is itself
+  in the repair set (that workflow's own completion still owes a genuine
+  repair attempt, and handing off to review now would race it). This requires
+  the caller's `workflows:` list to include every PR-triggered CI workflow.
+  Every other terminal conclusion — cancelled, stale, or any future value —
+  owes nothing further and does not keep the hold waiting forever: once
+  nothing is genuinely pending or still owed a repair attempt, reconciliation
+  proceeds to `review_held` instead of staying stuck on a completion that will
+  never arrive. This holds even for a fully terminal inventory with zero
+  genuine successes (e.g. skipped/neutral/cancelled/stale only) — it reconciles
+  to `review_held`, not an eternal `ci_unresolved`.
+
+  Reaching `unresolved` at all requires an *actually observed* pending run or
+  repair-set sibling — never merely an inventory that failed to prove itself
+  current. "Actually observed" has two sources: a repair-set (or pending)
+  entry in the freshly fetched inventory, or this invocation's own direct
+  `gh run view` re-read of the triggering run itself, when that read is a
+  repair-set conclusion, or a live attempt that has not yet completed, and
+  the inventory has not yet caught up to confirm or refute it. The second
+  source matters because a success-triggered invocation can observe, via its
+  own re-read, that the same run is now on a newer *failed*, or still
+  *pending*, attempt: the inventory alone would still show the stale success
+  and reconcile to `review_held`, handing off to Pro review before that
+  attempt's own serialized callback gets to run autofix (for a failed
+  attempt) or completes at all (for a pending one) — the directly observed
+  live state is real, queued-but-not-yet-run repair work or a run still in
+  flight, not a guess. The triggering run's own identity is re-bound to its
+  live `run_number`, `run_attempt`, and `conclusion` together, not
+  `run_number` alone: a rerun reuses the same `run_number` while
+  incrementing the attempt, so a matching run_number can still expose a
+  stale earlier attempt's conclusion under an eventually-consistent list.
+  Such a mismatch is treated as lagging, forcing the head non-green so a
+  stale success can never clear the safe-tier merge gate. The same live
+  re-read applies uniformly to every other watched-workflow run selected
+  from the inventory, not only the trigger: before any selected run counts
+  toward a success or a repair-set failure, it is re-read by its run ID and
+  its live `run_attempt`, `status`, and `conclusion` must match the
+  inventory entry exactly; a mismatch, or a live attempt that has not yet
+  completed, makes that inventory entry non-authoritative on its own and it
+  is treated as unresolved rather than trusted — this closes the same
+  reused-`run_number` staleness for a sibling's rerun that the trigger's own
+  rebinding already closed for itself, without replacing the trigger's more
+  nuanced handling (which also reacts to a *directly* observed pending or
+  repair-set conclusion, not just a list mismatch). An empty or still-lagging inventory for the triggering workflow is
+  retried a bounded number of times (`AUTOPILOT_CURRENCY_RETRY_SECONDS`, the
+  same knob autofix's own currency retry uses); if it is still empty or still
+  behind after the bound, that is not treated as an owed future event either
+  — it reconciles to `review_held`, a definite owner, rather than being
+  labelled `ci_unresolved` and left on a hold with no repair or review owner
+  because nothing was actually observed to still be pending.
+  - **Known boundary:** `still_owed` has no time bound — a repair-set sibling
+    is owed for as long as it stays in the repair set, full stop. A bounded
+    (time-based) version of this was tried and reverted: it cannot tell "the
+    producer died" from "the producer's callback is merely queued behind
+    this event" in the same FIFO concurrency group, and guessing wrong
+    breaks repair-before-review ordering by dropping a still-pending repair
+    and racing it into review. Two cases stay permanently outside what this
+    workflow alone can close, and both need the same caller-side scheduled
+    sweep — not implemented here:
+    1. A failed sibling's completion is the *last* watched event that will
+       ever fire for a given head. This workflow only reconciles when a
+       watched completion event arrives; if the repair-set sibling's own
+       completion never triggers a further invocation (no other watched
+       workflow runs again at that head), nothing inside this workflow
+       re-checks, and the PR stays `ci_unresolved` indefinitely.
+    2. A producer invocation dies before establishing ownership — e.g.
+       autofix's own job is killed mid-run (lost runner, host outage) after
+       Codex starts but before it labels the PR or hands off, or triage's
+       job dies before applying `pro-review`/`autopilot:review`. No label
+       was ever written, so there is no visible owner, and no further
+       completion event exists to retrigger reconciliation for that head.
+
+    Closing both needs a caller-side scheduled sweep: a periodic workflow
+    that lists open dependency-bot PRs carrying `autopilot:review` (or no
+    autopilot label at all) without `pro-review`/`skip-pro-review`/`claimed`/
+    `loop-run`, checks each one's *actual current* CI state directly via the
+    Checks/Runs API rather than waiting on another `workflow_run` event, and
+    re-invokes reconciliation (or opens review directly) for any that are
+    stuck. This workflow does not reimplement that sweep — it fails closed
+    by holding the PR under conservative review, not by inventing its own
+    deadline for a completion that already fired or a producer that never
+    got the chance to.
+- **Review held:** only an all-green risk hold is eligible for the existing
+  `pro-review` intake after fresh checks. A triggering conclusion is success
+  evidence only when it is literally `success`, `skipped`, or `neutral` — a
+  closed three-value allowlist, not an open list of "bad" values to catch.
+  Every other conclusion (`cancelled`, `stale`, or any value GitHub adds
+  later) is always forced to this tier (or to `ci_unresolved`) — never
+  treated as success evidence and never able to reach `green_safe` or a
+  merge, even if the freshly fetched inventory now looks all-green.
+- **Successful push:** preserves `autopilot:autofixed`. The hold is applied before
+  publishing AI changes so a label-write failure cannot leave them eligible for
+  automerge. If a push fails, the conservative review hold remains. The handoff
+  does **not** hand off this pushed SHA: it was published with a short-lived
+  GitHub App token, so CI genuinely re-fires on the new head, and
+  `autopilot:autofixed` already forces that head's own completion to
+  tier=review. Handing off the pre-rerun SHA would race that CI and could
+  strand the repair with no active owner if the rerun then failed.
+- **Already repaired:** a PR that already carries `autopilot:autofixed` has had
+  its one repair attempt. A second red completion on that PR does not start a
+  second repair; auto-fix admission refuses it and reconciles straight to the
+  terminal handoff so the still-red head goes to review instead of looping.
+- **No changes:** distinct from execution failure; it does not mean the CI failure
+  was repaired.
+- **Unavailable credentials:** the optional repair cannot run, but the unchanged
+  trusted PR may still be handed off using the caller's `GITHUB_TOKEN`.
+- **Failed execution:** a nonzero Codex exit fails the producer rather than being
+  reported as a successful no-op. The terminal handoff can still queue the
+  independently revalidated, unchanged PR. Missing provenance fails closed. A
+  forced job termination (job-level timeout, lost runner) that leaves the
+  outcome output empty is also inferred as failed execution, but only when the
+  job itself reports `failure` and had already bound a PR number and trigger
+  SHA before it died; a `cancelled` job or missing binding still fails closed.
+- **Currency indeterminate:** the run-list inventory used to judge whether the
+  triggering run is still current is eventually consistent and can lag behind
+  a direct run read. A run_number mismatch alone never proves supersession —
+  only a strictly newer list entry, or the run's own live conclusion no
+  longer matching the trigger, does. When the bounded retry cannot settle
+  either way, repair is refused (Codex never runs) but the unchanged PR still
+  reaches the terminal handoff, rather than being silently dropped the way a
+  proven-stale target is.
+- **Stale invocation (a strictly newer run exists):** a run-list entry with a
+  strictly greater run_number for the same workflow proves only that THIS
+  invocation is stale — it does not validate that newer run's own inventory
+  entry (which may itself still be mid-flight: an earlier attempt succeeded,
+  a later attempt is failing or pending, and the list has not caught up). A
+  stale invocation stops immediately as `stale_rejected` in both producers:
+  no merge, no repair, no green classification, and it never reaches the
+  terminal handoff (see "Existing owner / stale or rejected target" below).
+  It cannot strand the PR: the newer run is itself a watched workflow, so its
+  own invocation of this reusable workflow either is still queued behind
+  this one in the FIFO `queue: max` concurrency group, or has already run and
+  already established an owner.
+- **Existing owner / stale or rejected target:** no handoff. Drafts, human
+  assignees, pending User or Team review requests, and `pro-review`,
+  `skip-pro-review`, `claimed`, or `loop-run` labels prevent a second writer from
+  being admitted. A changed head is not silently substituted for the head the
+  producer handled.
+- **Fork-branch collision (same-repository filtering):** `gh pr list --head
+  "$BRANCH"` matches by branch name only — it cannot be scoped to
+  `<owner>:<branch>` — so on a public caller repo, an untrusted fork PR
+  opened from a branch matching a predictable dependency-bot name (e.g. a
+  Dependabot/Renovate branch) can otherwise appear alongside the legitimate
+  same-repository PR and, via a naive uniqueness check, be used to block
+  triage, repair, and handoff for the real PR. Every `gh pr list --head`
+  lookup site (triage, autofix, handoff) filters candidates to
+  `isCrossRepository == false` **before** enforcing uniqueness or any
+  identity/bot-trust check; this narrows the candidate set and does not
+  weaken any existing guard, including the later per-candidate
+  `isCrossRepository` check kept as defense in depth. The three copies are
+  kept byte-identical by a marker-comment lockstep guard (matching the
+  existing trigger-currency predicate guard), enforced by
+  `tests/test_dependency_autopilot.py`.
+
+A newly requested handoff records the source CI, producer outcome, and expected
+head in one SHA-keyed PR comment, then applies `pro-review`. Only a marker authored
+by `github-actions[bot]` with REST user type `Bot` is authoritative; human and
+other-bot lookalikes do not suppress the workflow-owned comment. Repeated events
+do not repeat the handoff. Existing label metadata is not overwritten. API
+failures are visible as failed jobs, not reported as successful queue events.
+
+The **existing pro-review daemon** owns the next review/repair action. It consumes
+`pro-review`, binds decisions to a PR/head, and may repair confirmed findings. It
+**never merges**; final disposition remains with the existing author/merge
+workflow and its policies. This integration does not grant merge authority,
+apply `loop-ok`, change service configuration, rotate credentials, or enable
+all-PR review mode.
+
+A persistent GitHub label is not an atomic SHA lease. The workflow rechecks head
+and ownership before mutation and skips explicit active owners; a new owner or
+push can still arrive between API calls. The consumer must independently bind
+its effects to its current head. Ownership not represented in PR metadata is not
+visible to this producer.
+
+### Verification
+
+```bash
+bash tests/classify-tier.test.sh
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+mise exec actionlint@1.7.12 -- actionlint \
+  -ignore '^unexpected key "queue" for "concurrency" section\. expected one of "cancel-in-progress", "group"$' \
+  .github/workflows/*.yml
+```
+
+Actionlint v1.7.12, and upstream at `011a6d15e749bb3f2d771eed9c7aa0e7e3e10ee7`,
+still reject GitHub's documented workflow-level `queue` property. The anchored ignore
+suppresses only that exact unsupported-property message; all other lint findings
+remain active. Remove the ignore when actionlint supports `concurrency.queue`. The
+executable graph test independently pins `queue: max`, `cancel-in-progress: false`,
+and the absence of per-job concurrency.
+
+The Python tests use PyYAML (also used by CI's YAML parse check). They execute the
+actual workflow shell blocks, with GitHub, Git, and Codex replaced only at the
+external CLI boundary. Producer-to-handoff cases pass actual step outputs into
+the next block; they do not copy the classifier into a new implementation.
+
+These tests prove routing and failure behavior, not live review completion. A
+bounded live check must record the real caller run, PR/head, queue event, and
+consumer result. `pro-review` being present, a unit being `active`, or an absence
+of new PRs is not proof that a review ran. Check the daemon journal for actual
+processing or a concrete deferral (for example runtime/plugin version skew), and
+never record a queued or deferred request as delivered.
