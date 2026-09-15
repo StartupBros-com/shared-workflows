@@ -1097,6 +1097,10 @@ jobs:
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          # Contents publishes the repair; PR write covers PR metadata and labels.
+          # Keep the default caller-repository scope and post-job revocation.
+          permission-contents: write
+          permission-pull-requests: write
 
       - name: Hold the PR for review before publishing an AI fix
         if: ${{ steps.pre.outputs.ok == '1' && steps.guard.outputs.changed == '1' }}
