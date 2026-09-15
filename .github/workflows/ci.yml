@@ -36,3 +36,17 @@ jobs:
               || { echo "::error::$wf is not valid YAML"; exit 1; }
             echo "ok - $wf"
           done
+
+      - name: Security-lint workflows
+        # The pinned action also pins its default scanner image by digest.
+        # Dependabot's existing github-actions updates maintain this one pin.
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          inputs: .github/workflows/
+          advanced-security: false
+          online-audits: false
+          token: ''
+          persona: regular
+          min-severity: medium
+          min-confidence: medium
+          annotations: true
