@@ -89,6 +89,7 @@ jobs:
   autopilot:
     if: >-
       github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
       (startsWith(github.event.workflow_run.head_branch, 'dependabot/') ||
        startsWith(github.event.workflow_run.head_branch, 'renovate/'))
     uses: StartupBros-com/shared-workflows/.github/workflows/dependency-autopilot.yml@<reviewed-commit-sha>
@@ -126,8 +127,8 @@ caller's job has already evaluated, and any `secrets:` block it passed
 (`APP_PRIVATE_KEY`, `CODEX_AUTH`) has already been made available to that
 job's runner. A `workflow_run` event fires for runs from forks too — GitHub
 grants no repository-identity filtering on the trigger itself — so a caller
-whose `if:` condition only checks `event` and `head_branch` (as the example
-above does) invokes this reusable workflow, and exposes those secrets to its
+whose `if:` condition only checks `event` and `head_branch`, omitting the
+repository check shown above, invokes this reusable workflow and exposes secrets to its
 job environment, for a fork-originated run at the same predictable branch
 name. This reusable workflow's internal admission gate stops that run from
 being treated as provenance before any privileged action (Codex invocation,
