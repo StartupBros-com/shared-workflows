@@ -1097,10 +1097,6 @@ jobs:
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          # Contents publishes the repair; PR write covers PR metadata and labels.
-          # Keep the default caller-repository scope and post-job revocation.
-          permission-contents: write
-          permission-pull-requests: write
 
       - name: Hold the PR for review before publishing an AI fix
         if: ${{ steps.pre.outputs.ok == '1' && steps.guard.outputs.changed == '1' }}
@@ -1300,4 +1296,287 @@ jobs:
                 stale_rejected) skip "auto-fix rejected a stale or ineligible target" ;;
                 failed_execution)
                   # A failed repair is unresolved work, not a clean no-op. Only the
-                  # unchanged, independently revalidated... (go/truncated-by-rlsnow)...
+                  # unchanged, independently revalidated PR is eligible below.
+                  expected_sha="$AUTOFIX_TRIGGER_SHA"
+                  # Round-14: also unchanged (no push) — same sibling check.
+                  red_unresolved_check="1"
+                  ;;
+                *) fail "auto-fix returned missing outcome metadata" ;;
+              esac
+              num="$AUTOFIX_NUMBER"
+              trigger_sha="$AUTOFIX_TRIGGER_SHA"
+              ;;
+            *)
+              # Every other terminal conclusion — success, skipped, neutral,
+              # cancelled, stale, and any value GitHub adds later — reconciles
+              # through triage. There is no enumerated "known good" list and
+              # no silent fall-through: anything outside the tightly-scoped
+              # repair set above lands here, not in a dropped default case.
+              producer_outcome="$TRIAGE_OUTCOME"
+              [ "$TRIAGE_RESULT" = "success" ] || fail "triage did not finish successfully"
+              case "$producer_outcome" in
+                green_safe) skip "safe green PRs stay in the inexpensive ready queue" ;;
+                review_held) : ;;
+                ci_unresolved) skip "sibling CI is unresolved; defer to its watched completion event" ;;
+                existing_owner) skip "an existing review or active owner already controls this PR" ;;
+                stale_rejected) skip "triage rejected a stale or ineligible target" ;;
+                *) fail "triage returned missing or failed outcome metadata" ;;
+              esac
+              num="$TRIAGE_NUMBER"
+              trigger_sha="$TRIAGE_TRIGGER_SHA"
+              expected_sha="$trigger_sha"
+              ;;
+          esac
+
+          [ -n "$num" ] || fail "producer did not supply a PR number"
+          [ -n "$trigger_sha" ] || fail "producer did not supply the triggering PR head"
+          [ -n "$expected_sha" ] || fail "producer did not supply the expected terminal head"
+
+          run_file="$RUNNER_TEMP/handoff-run.json"
+          prs_file="$RUNNER_TEMP/handoff-prs.json"
+          candidate_file="$RUNNER_TEMP/handoff-candidate.json"
+          fresh_file="$RUNNER_TEMP/handoff-fresh.json"
+          comments_file="$RUNNER_TEMP/handoff-comments.json"
+
+          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json event,headSha,url,workflowDatabaseId > "$run_file"
+          run_event=$(jq -r '.event // ""' "$run_file")
+          run_sha=$(jq -r '.headSha // ""' "$run_file")
+          run_url=$(jq -r '.url // ""' "$run_file")
+          [ "$run_event" = "pull_request" ] || fail "triggering run is not pull_request provenance"
+          [ -n "$run_sha" ] || fail "triggering run head SHA is missing"
+          [ -n "$run_url" ] || fail "triggering run URL is missing"
+          [ "$run_sha" = "$trigger_sha" ] || fail "producer provenance does not match the triggering run head"
+
+          # Round-12 P0: a public fork can open a PR from a branch with the
+          # SAME NAME as this dependency-bot branch and push the exact same
+          # commit, giving its own `pull_request` CI run the SAME head SHA
+          # just checked above. Head-SHA equality is provenance-blind to
+          # WHICH repository produced that commit — `gh run view --json`
+          # exposes no field for the run's owning repository (see `gh run
+          # view --help`'s JSON FIELDS), so fetch the run's REST object
+          # directly for `head_repository.full_name` and `head_branch`.
+          # Fail CLOSED: an unconfirmable value is treated exactly like a
+          # mismatched one — this gates a privileged action (Codex log
+          # input, credential minting, merge), so uncertainty must never
+          # admit. Kept BYTE-IDENTICAL across all three call sites (triage,
+          # autofix, handoff) — tests/test_dependency_autopilot.py's
+          # test_fork_provenance_gate_is_locked_across_call_sites extracts
+          # each copy verbatim and fails the suite the moment a future edit
+          # touches one site without the others. Each site still applies
+          # its own admission action immediately below (stop vs. fail):
+          # triage/autofix and handoff use different control-flow helpers,
+          # so that one line cannot itself be shared.
+          # autopilot-fork-provenance-gate:begin
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > "$RUNNER_TEMP/run-provenance.json"
+          run_provenance_repo=$(jq -r '.head_repository.full_name // ""' "$RUNNER_TEMP/run-provenance.json")
+          run_provenance_branch=$(jq -r '.head_branch // ""' "$RUNNER_TEMP/run-provenance.json")
+          run_same_repo_and_branch="false"
+          if [ -n "$run_provenance_repo" ] && [ "$run_provenance_repo" = "$GITHUB_REPOSITORY" ] \
+             && [ -n "$run_provenance_branch" ] && [ "$run_provenance_branch" = "$BRANCH" ]; then
+            run_same_repo_and_branch="true"
+          fi
+          # autopilot-fork-provenance-gate:end
+          [ "$run_same_repo_and_branch" = "true" ] || fail "run $RUN_ID's head repository/branch is not confirmed as $GITHUB_REPOSITORY/$BRANCH (got '${run_provenance_repo:-unconfirmed}'/'${run_provenance_branch:-unconfirmed}'); a fork run cannot serve as CI provenance for this PR even at a matching head SHA"
+
+          # Round-14 P1: a red producer that left the head UNCHANGED (no
+          # push — no_changes/unavailable_credentials/already_repaired/
+          # currency_indeterminate/failed_execution) reached this far
+          # treating itself as immediately reviewable. But branch-level FIFO
+          # concurrency means a sibling workflow that ALSO failed on this
+          # same head may still be queued behind this very invocation, with
+          # its own repair attempt still owed — exactly what triage's own
+          # reconciliation (the same two marker blocks below) already
+          # defers for. Applying pro-review here first would let autofix's
+          # admission gate on the queued sibling's own callback see an
+          # existing owner label and skip its repair turn entirely (this is
+          # the finding: a red no-change callback handing off before a
+          # queued sibling failure gets its repair turn). Run the identical
+          # live sibling check triage uses, scoped to this expected head,
+          # and defer exactly when it does: another watched workflow is
+          # still pending, or already concluded into the repair set and
+          # owes its own serialized autofix turn. An inventory with no such
+          # sibling reaches a definite owner below, same as today.
+          if [ "$red_unresolved_check" = "1" ]; then
+          runs_file="$RUNNER_TEMP/handoff-runs.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$expected_sha&event=pull_request&per_page=100" \
+            --paginate --slurp > "$runs_file"
+          latest=$(jq --arg repo "$GITHUB_REPOSITORY" --arg branch "$BRANCH" --argjson num "$num" '
+            [ .[] | .workflow_runs[]
+              | select(.head_repository.full_name == $repo)
+              | select(.head_branch == $branch)
+              | select((.pull_requests // []) == [] or any(.pull_requests[]?; .number == $num))
+            ]
+            | group_by(.workflow_id) | map(max_by(.run_number))' "$runs_file")
+          t_wf=$(jq -r '.workflowDatabaseId' "$run_file")
+          # autopilot-sibling-verification:begin
+          verified="[]"
+          while IFS= read -r sib; do
+            sib_wf=$(jq -r '.workflow_id' <<<"$sib")
+            if [ "$sib_wf" != "$t_wf" ]; then
+              sib_id=$(jq -r '.id' <<<"$sib")
+              sib_attempt=$(jq -r '.run_attempt // 1' <<<"$sib")
+              sib_concl=$(jq -r '.conclusion // ""' <<<"$sib")
+              sib_live=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$sib_id")
+              sib_live_status=$(jq -r '.status // ""' <<<"$sib_live")
+              sib_live_attempt=$(jq -r '.run_attempt // empty' <<<"$sib_live")
+              sib_live_concl=$(jq -r '.conclusion // ""' <<<"$sib_live")
+              if [ "$sib_live_status" != "completed" ] || [ "$sib_live_attempt" != "$sib_attempt" ] || [ "$sib_live_concl" != "$sib_concl" ]; then
+                echo "::notice::sibling workflow $sib_wf's run-list entry (run $sib_id, attempt $sib_attempt, concluded '$sib_concl') does not match a fresh read of that same run (status '${sib_live_status:-none}', attempt '${sib_live_attempt:-none}', concluded '${sib_live_concl:-none}'); treating it as unresolved rather than trusting the list."
+                sib=$(jq '.conclusion = null' <<<"$sib")
+              fi
+            fi
+            verified=$(jq --argjson e "$sib" '. + [$e]' <<<"$verified")
+          done < <(jq -c '.[]' <<<"$latest")
+          latest="$verified"
+          # autopilot-sibling-verification:end
+          # autopilot-sibling-still-owed:begin
+          still_owed=$(jq --argjson wf "$t_wf" --argjson repair '["failure","timed_out","action_required","startup_failure"]' '
+                    [ .[] | select(.workflow_id != $wf) | select(
+                        .conclusion == null
+                        or (.conclusion as $c | $repair | any(. == $c))
+                      ) ] | length' <<<"$latest")
+          unresolved=0
+          [ "$still_owed" -gt 0 ] && unresolved=1
+          # autopilot-sibling-still-owed:end
+          [ "$unresolved" != "1" ] || skip "sibling CI is unresolved; defer to its watched completion event"
+          fi
+
+          # Round-12 P1: `gh pr list --head` matches by branch name ONLY,
+          # with no server-side owner scoping and a default 30-item cap —
+          # so an attacker who opens MORE fork PRs on this predictable
+          # branch name than the cap can crowd the legitimate same-repo PR
+          # out of the result entirely; the same-repo filter below would
+          # then have nothing left to keep, reproducing the exact denial
+          # of service round 11 fixed. Resolve the same-repository head IN
+          # THE QUERY instead: the REST `pulls` list endpoint's
+          # `head=<owner>:<ref>` parameter is server-side owner-qualified,
+          # so a fork PR (whose head repository owner never matches) is
+          # excluded from the response ITSELF, not merely paginated past,
+          # however many of them exist. Map the REST shape to the same
+          # fields the rest of this script already expects, so the
+          # same-repo filter and every check below stay unchanged. Kept
+          # BYTE-IDENTICAL across all three call sites (triage, autofix,
+          # handoff) — tests/test_dependency_autopilot.py's
+          # test_scoped_pr_lookup_is_locked_across_lookup_sites extracts
+          # each copy verbatim and fails the suite the moment a future
+          # edit touches one site without the others.
+          # autopilot-scoped-pr-lookup:begin
+          gh api "repos/$GITHUB_REPOSITORY/pulls?head=${GITHUB_REPOSITORY%%/*}:$BRANCH&state=open&per_page=100" \
+            --paginate --slurp > "$RUNNER_TEMP/pr-lookup-raw.json"
+          jq --arg repo "$GITHUB_REPOSITORY" '
+            [ .[] | .[]
+              | {
+                  number, title,
+                  state: ((.state // "") | ascii_upcase),
+                  isDraft: (.draft // false),
+                  author: { login: (.user.login // ""), is_bot: ((.user.type // "") == "Bot") },
+                  baseRefName: (.base.ref // ""),
+                  headRefName: (.head.ref // ""),
+                  headRefOid: (.head.sha // ""),
+                  isCrossRepository: ((.head.repo.full_name // "") != $repo),
+                  labels: [ (.labels // [])[] | {name} ],
+                  assignees: [ (.assignees // [])[] | { login: (.login // ""), is_bot: ((.type // "") == "Bot") } ],
+                  reviewRequests: ((.requested_reviewers // []) + (.requested_teams // []))
+                }
+            ]' "$RUNNER_TEMP/pr-lookup-raw.json" > "$prs_file"
+          # autopilot-scoped-pr-lookup:end
+          # A public caller repo lets anyone open an UPSTREAM PR from a FORK
+          # branch matching a predictable dependency-bot branch name (e.g. a
+          # Dependabot/Renovate branch). gh 2.97.0's `--head` flag does not
+          # support "<owner>:<branch>" qualification ("<owner>:<branch>"
+          # syntax not supported, per `gh pr list --help`), so the list
+          # above can return that fork PR alongside the legitimate same-repo
+          # one, and the uniqueness check just below would then
+          # deterministically reject BOTH as ambiguous — before
+          # isCrossRepository or bot-trust is ever checked — a cheap denial
+          # of service on this whole automation by an unauthenticated third
+          # party. isCrossRepository is already present in the fetched
+          # JSON, so drop cross-repository candidates HERE, before
+          # uniqueness is enforced: this narrows the candidate set, it does
+          # not weaken any guard. The later per-candidate isCrossRepository
+          # check stays in place as defense in depth — it can no longer
+          # fire once this filter has run, but it stays cheap, explicit,
+          # and protects any future call site that forgets this filter.
+          # Kept BYTE-IDENTICAL across all three PR-lookup sites (triage,
+          # autofix, handoff) — tests/test_dependency_autopilot.py's
+          # test_same_repo_filter_is_locked_across_lookup_sites extracts
+          # each copy verbatim and fails the suite the moment a future edit
+          # touches one site without the others.
+          # autopilot-same-repo-filter:begin
+          jq '[ .[] | select(.isCrossRepository == false) ]' "$prs_file" > "$prs_file.same-repo"
+          mv "$prs_file.same-repo" "$prs_file"
+          # autopilot-same-repo-filter:end
+          count=$(jq 'length' "$prs_file")
+          [ "$count" = "1" ] || skip "target is closed, missing, or ambiguous"
+          jq '.[0]' "$prs_file" > "$candidate_file"
+
+          block_reason=""
+          validate_target() {
+            local file="$1" author is_bot norm xrepo base head_branch head_sha state human_assignees pending_reviews owner_label
+            author=$(jq -r '.author.login // ""' "$file")
+            is_bot=$(jq -r '.author.is_bot // false' "$file")
+            norm="${author#app/}"; norm="${norm%\[bot\]}"
+            xrepo=$(jq -r '.isCrossRepository' "$file")
+            base=$(jq -r '.baseRefName // ""' "$file")
+            head_branch=$(jq -r '.headRefName // ""' "$file")
+            head_sha=$(jq -r '.headRefOid // ""' "$file")
+            state=$(jq -r '.state // ""' "$file")
+            [ "$is_bot" = "true" ] || { block_reason="author is not a bot/app"; return 1; }
+            case "$norm" in dependabot|startupbros-autopilot) : ;; *) block_reason="author is not an allowlisted dependency bot"; return 1 ;; esac
+            [ "$xrepo" = "false" ] || { block_reason="cross-repository target"; return 1; }
+            [ "$base" = "main" ] || { block_reason="base is not main"; return 1; }
+            [ "$head_branch" = "$BRANCH" ] || { block_reason="head branch changed"; return 1; }
+            [ "$head_sha" = "$expected_sha" ] || { block_reason="head moved from expected $expected_sha to $head_sha"; return 1; }
+            case "$state" in OPEN|open) : ;; *) block_reason="PR is not open"; return 1 ;; esac
+            [ "$(jq -r '.isDraft // false' "$file")" = "false" ] || { block_reason="PR is a draft"; return 1; }
+            for owner_label in pro-review skip-pro-review claimed loop-run; do
+              if jq -e --arg label "$owner_label" 'any(.labels[]?; .name == $label)' "$file" >/dev/null; then
+                block_reason="existing owner label '$owner_label'"
+                return 1
+              fi
+            done
+            human_assignees=$(jq '[.assignees[]? | select((.is_bot // false) != true)] | length' "$file")
+            [ "$human_assignees" = "0" ] || { block_reason="human assignee already owns the PR"; return 1; }
+            pending_reviews=$(jq '.reviewRequests // [] | length' "$file")
+            [ "$pending_reviews" = "0" ] || { block_reason="pending review request already owns the PR"; return 1; }
+          }
+
+          candidate_num=$(jq -r '.number' "$candidate_file")
+          [ "$candidate_num" = "$num" ] || skip "producer PR number no longer matches the branch target"
+          if ! validate_target "$candidate_file"; then skip "$block_reason"; fi
+
+          # Refresh before any mutation. PR labels are not an atomic SHA lease;
+          # the consumer must still bind its effects to the head it actually reads.
+          gh pr view "$num" --repo "$GITHUB_REPOSITORY" \
+            --json number,state,author,assignees,reviewRequests,baseRefName,headRefName,headRefOid,isCrossRepository,isDraft,labels > "$fresh_file"
+          if ! validate_target "$fresh_file"; then skip "$block_reason"; fi
+
+          marker="<!-- dependency-autopilot-handoff:$expected_sha -->"
+          gh api "repos/$GITHUB_REPOSITORY/issues/$num/comments?per_page=100" --paginate --slurp > "$comments_file"
+          if ! jq -e --arg marker "$marker" '
+                any(.[][]?;
+                  .user.type == "Bot" and
+                  .user.login == "github-actions[bot]" and
+                  ((.body // "") | contains($marker)))
+              ' "$comments_file" >/dev/null; then
+            body=$(printf '%s\n%s\n%s\n%s\n%s' \
+              "$marker" \
+              "Requesting review for PR #$num at \`$expected_sha\`." \
+              "Producer outcome: \`$producer_outcome\`." \
+              "Source CI: $run_url" \
+              "Next owner: the existing pro-review daemon once the pro-review label is present. This request is not a completed review or a merge; see the handoff job for enqueue failures.")
+            gh pr comment "$num" --repo "$GITHUB_REPOSITORY" --body "$body"
+          fi
+          gh label create "pro-review" --repo "$GITHUB_REPOSITORY" \
+            --color 5319e7 --description "Existing pro-review daemon queue" \
+            || gh api "repos/$GITHUB_REPOSITORY/labels/pro-review" --silent
+          # Recheck after the audit write as well: a new author or head may have
+          # arrived during API calls. Repeated events reuse the request above.
+          gh pr view "$num" --repo "$GITHUB_REPOSITORY" \
+            --json number,state,author,assignees,reviewRequests,baseRefName,headRefName,headRefOid,isCrossRepository,isDraft,labels > "$fresh_file"
+          if ! validate_target "$fresh_file"; then skip "$block_reason"; fi
+          gh pr edit "$num" --repo "$GITHUB_REPOSITORY" --add-label "pro-review"
+
+          handoff_status="queued"
+          detail="queued $expected_sha for the existing pro-review daemon; consumption is verified separately"
+          echo "::notice::$detail"
