@@ -45,7 +45,6 @@ jobs:
           inputs: .github/workflows/
           advanced-security: false
           online-audits: false
-          token: ''
           persona: regular
           min-severity: medium
           min-confidence: medium
