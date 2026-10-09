@@ -453,6 +453,14 @@ if name == "gh":
             def to_rest(pr):
                 pr = decorate(pr)
                 author = pr.get("author", {})
+                # Fixtures use gh's exported author shape. REST uses the
+                # Bot account login instead: dependabot[bot], for example,
+                # becomes app/dependabot in gh pr view --json author.
+                # Keep these independent API representations in every
+                # default fixture so a raw-login safety comparison fails.
+                author_login = author.get("login", "")
+                if author.get("is_bot") and author_login.startswith("app/"):
+                    author_login = author_login.removeprefix("app/") + "[bot]"
                 cross = pr.get("isCrossRepository", False)
                 head_repo = "attacker/fork" if cross else repo_full_name
                 return {
@@ -461,7 +469,7 @@ if name == "gh":
                     "state": (pr.get("state", "OPEN") or "OPEN").lower(),
                     "draft": pr.get("isDraft", False),
                     "user": {
-                        "login": author.get("login", ""),
+                        "login": author_login,
                         "type": "Bot" if author.get("is_bot") else "User",
                     },
                     "base": {"ref": pr.get("baseRefName", "")},
