@@ -574,9 +574,22 @@ jobs:
           gh pr view "$num" --repo "$GITHUB_REPOSITORY" \
             --json number,author,assignees,reviewRequests,baseRefName,headRefName,headRefOid,isCrossRepository,isDraft,labels,state,title > "$fresh_file"
           jq -e --slurpfile fresh "$fresh_file" '
+            # REST exposes <app>[bot]; gh pr view exports app/<app>.
+            # Equate only exact aliases of the already-allowlisted bots,
+            # and only for a verified bot. Do not strip arbitrary prefixes
+            # or suffixes: that could hide a different or forged actor.
+            def author_identity:
+              (.author.login // "") as $login
+              | if .author.is_bot == true and
+                   ($login == "dependabot[bot]" or $login == "app/dependabot")
+                then "dependabot[bot]"
+                elif .author.is_bot == true and
+                     ($login == "startupbros-autopilot[bot]" or $login == "app/startupbros-autopilot")
+                then "startupbros-autopilot[bot]"
+                else $login end;
             def safety: {
               number,
-              author_login: (.author.login // ""),
+              author_login: author_identity,
               author_is_bot: (.author.is_bot // false),
               baseRefName, headRefName, headRefOid, isCrossRepository, state, isDraft
             };

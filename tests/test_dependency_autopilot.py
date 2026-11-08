@@ -123,6 +123,127 @@ class WorkflowTests(unittest.TestCase):
                         self.success(subprocess.run(["bash", "-n"], input=item["run"],
                                                     text=True, capture_output=True, check=False))
 
+    def test_harness_keeps_rest_and_cli_bot_author_shapes_distinct(self):
+        for bot in ("dependabot", "startupbros-autopilot"):
+            with self.subTest(bot=bot):
+                harness = self.harness(prs=[trusted_pr(
+                    author={"login": f"app/{bot}", "is_bot": True},
+                )])
+                self.success(harness.run("triage", "triage"))
+                rest = json.loads((harness.root / "pr-lookup-raw.json").read_text())[0][0]
+                cli = json.loads((harness.root / "triage-fresh.json").read_text())
+                self.assertEqual(rest["user"], {"login": f"{bot}[bot]", "type": "Bot"})
+                self.assertEqual(cli["author"], {"login": f"app/{bot}", "is_bot": True})
+                self.assertNotEqual(rest["user"]["login"], cli["author"]["login"])
+
+    def test_author_identity_maps_only_exact_verified_bot_aliases(self):
+        # Exercise the production jq helper directly to prove non-bots and
+        # unknown spellings are unchanged, even before the separate
+        # author_is_bot safety binding rejects them in the full script.
+        script = step("triage", "triage")["run"]
+        helper = re.search(r"def author_identity:.*?;", script, re.S)
+        self.assertIsNotNone(helper)
+        aliases = {
+            "dependabot[bot]": "dependabot[bot]",
+            "app/dependabot": "dependabot[bot]",
+            "startupbros-autopilot[bot]": "startupbros-autopilot[bot]",
+            "app/startupbros-autopilot": "startupbros-autopilot[bot]",
+        }
+        logins = list(aliases) + [
+            "dependabot", "startupbros-autopilot", "app/dependabot[bot]",
+            "app/startupbros-autopilot[bot]", "app/app/dependabot",
+            "app/renovate", "renovate[bot]", "app/untrusted", "untrusted[bot]",
+            "operator", "", "app/dependabot ", "app/Dependabot",
+        ]
+        fixtures, expected = [], []
+        for login in logins:
+            for bot_flag in ({"is_bot": True}, {"is_bot": False}, {},
+                             {"is_bot": None}, {"is_bot": "true"}):
+                fixtures.append({"author": {"login": login} | bot_flag})
+                expected.append(aliases.get(login, login)
+                                if bot_flag.get("is_bot") is True else login)
+        result = subprocess.run(
+            ["jq", "-c", helper.group(0) + " [.[] | author_identity]"],
+            input=json.dumps(fixtures), text=True, capture_output=True, check=False,
+        )
+        self.success(result)
+        self.assertEqual(json.loads(result.stdout), expected)
+
+    def test_triage_same_trusted_bot_alias_reaches_review_handoff(self):
+        # Execute the production REST lookup, CLI refresh, classification,
+        # and handoff. Exact aliases for one allowlisted bot are equivalent;
+        # the two bot families remain distinct (negative cases below).
+        for bot in ("dependabot", "startupbros-autopilot"):
+            for fresh_login in (f"app/{bot}", f"{bot}[bot]"):
+                with self.subTest(bot=bot, fresh_login=fresh_login):
+                    harness = self.harness(
+                        prs=[trusted_pr(author={"login": f"app/{bot}", "is_bot": True})],
+                        views=[trusted_pr(author={"login": fresh_login, "is_bot": True})],
+                    )
+                    self.success(harness.run("triage", "triage", MODE="automerge"))
+                    producer = harness.outputs()
+                    self.assertEqual(producer["outcome"], "review_held")
+                    self.success(self.handoff(
+                        harness, TRIAGE_OUTCOME=producer["outcome"],
+                        TRIAGE_NUMBER=producer["number"],
+                        TRIAGE_TRIGGER_SHA=producer["trigger_sha"],
+                    ))
+                    self.assert_queued(harness)
+
+    def test_triage_rejects_changed_or_forged_bot_identity(self):
+        for bot, other in (("dependabot", "startupbros-autopilot"),
+                           ("startupbros-autopilot", "dependabot")):
+            authors = [
+                {"login": login, "is_bot": True}
+                for login in (
+                    f"app/{other}", f"{other}[bot]", "app/renovate",
+                    "renovate[bot]", "app/untrusted", "untrusted[bot]",
+                    f"app/{bot}[bot]", f"app/app/{bot}", bot,
+                    f"{bot}[bot][bot]", f"app/{bot}-spoof", f"app/{bot} ",
+                )
+            ] + [
+                {"login": f"app/{bot}", "is_bot": False},
+                {"login": f"{bot}[bot]", "is_bot": False},
+                {"login": f"app/{bot}"},
+                {"login": f"{bot}[bot]"},
+                {"login": f"app/{bot}", "is_bot": "true"},
+                {"login": f"app/{bot}", "is_bot": None},
+            ]
+            for author in authors:
+                with self.subTest(bot=bot, author=author):
+                    harness = self.harness(
+                        prs=[trusted_pr(author={"login": f"app/{bot}", "is_bot": True})],
+                        views=[trusted_pr(author=author)],
+                    )
+                    result = harness.run("triage", "triage", MODE="automerge")
+                    self.success(result)
+                    self.assertEqual(harness.outputs()["outcome"], "stale_rejected")
+                    self.assertEqual(self.mutation_calls(harness), [])
+                    self.assertIn("changed safety identity", result.stdout)
+
+    def test_triage_alias_normalization_preserves_every_other_identity_field(self):
+        cases = (
+            {"number": 22}, {"baseRefName": "develop"},
+            {"headRefName": "dependabot/npm/another-branch"},
+            {"headRefOid": NEW_SHA}, {"isCrossRepository": True},
+            {"state": "CLOSED"}, {"isDraft": True},
+        )
+        for changes in cases:
+            with self.subTest(changes=changes):
+                harness = self.harness(views=[trusted_pr(**changes)])
+                self.success(harness.run("triage", "triage", MODE="automerge"))
+                self.assertEqual(harness.outputs()["outcome"], "stale_rejected")
+                self.assertEqual(self.mutation_calls(harness), [])
+
+    def test_triage_alias_normalization_classifies_the_fresh_update_type(self):
+        harness = self.harness(
+            prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
+            views=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 2.0.0")],
+        )
+        self.success(harness.run("triage", "triage", MODE="automerge"))
+        self.assertEqual(harness.outputs()["outcome"], "review_held")
+        self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in harness.calls()))
+
     def test_automerge_remains_bound_to_the_classified_head(self):
         harness = self.harness(prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")])
         self.success(harness.run("triage", "triage", MODE="automerge"))
@@ -494,8 +615,11 @@ class WorkflowTests(unittest.TestCase):
             ({"headRefOid": NEW_SHA}, "stale_rejected"),
             ({"labels": [{"name": "claimed"}]}, "existing_owner"),
             ({"labels": [{"name": "skip-pro-review"}]}, "existing_owner"),
+            ({"labels": [{"name": "pro-review"}]}, "existing_owner"),
+            ({"labels": [{"name": "loop-run"}]}, "existing_owner"),
             ({"assignees": [{"login": "operator"}]}, "existing_owner"),
             ({"reviewRequests": [{"__typename": "Team", "slug": "maintainers"}]}, "existing_owner"),
+            ({"reviewRequests": [{"__typename": "User", "login": "operator"}]}, "existing_owner"),
         )
         for changes, expected in cases:
             with self.subTest(changes=changes):
