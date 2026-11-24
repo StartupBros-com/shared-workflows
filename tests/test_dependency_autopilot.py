@@ -21,6 +21,18 @@ from autopilot_harness import (
 )
 
 
+def failed_rerun_with_stale_inventory():
+    """The live read sees failed attempt 2; inventory still shows success at attempt 1."""
+    return {
+        "run": RUN | {
+            "workflowDatabaseId": 1, "number": 11, "attempt": 2, "conclusion": "failure",
+        },
+        "runs": {"workflow_runs": [
+            {"workflow_id": 1, "run_number": 11, "run_attempt": 1, "conclusion": "success"},
+        ]},
+    }
+
+
 class WorkflowTests(unittest.TestCase):
     maxDiff = None
 
@@ -789,10 +801,7 @@ class WorkflowTests(unittest.TestCase):
         # reach green_safe or merge on a stale attempt's success.
         harness = self.harness(
             prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
-            run=RUN | {"workflowDatabaseId": 1, "number": 11, "attempt": 2, "conclusion": "failure"},
-            runs={"workflow_runs": [
-                {"workflow_id": 1, "run_number": 11, "run_attempt": 1, "conclusion": "success"},
-            ]},
+            **failed_rerun_with_stale_inventory(),
         )
         self.success(harness.run(
             "triage", "triage", CI_CONCLUSION="success", MODE="automerge",
@@ -1001,10 +1010,7 @@ class WorkflowTests(unittest.TestCase):
         # breaking repair-before-review ordering.
         harness = self.harness(
             prs=[trusted_pr(title="chore(deps): bump pkg from 1.0.0 to 1.0.1")],
-            run=RUN | {"workflowDatabaseId": 1, "number": 11, "attempt": 2, "conclusion": "failure"},
-            runs={"workflow_runs": [
-                {"workflow_id": 1, "run_number": 11, "run_attempt": 1, "conclusion": "success"},
-            ]},
+            **failed_rerun_with_stale_inventory(),
         )
         self.success(harness.run(
             "triage", "triage", CI_CONCLUSION="success", AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
@@ -1273,12 +1279,7 @@ class WorkflowTests(unittest.TestCase):
         # current, consuming the once-only repair attempt against a head
         # whose currency is unproven. Must stay indeterminate: no Codex, no
         # repair attempt consumed.
-        harness = self.harness(
-            run=RUN | {"workflowDatabaseId": 1, "number": 11, "attempt": 2, "conclusion": "failure"},
-            runs={"workflow_runs": [
-                {"workflow_id": 1, "run_number": 11, "run_attempt": 1, "conclusion": "success"},
-            ]},
-        )
+        harness = self.harness(**failed_rerun_with_stale_inventory())
         self.success(harness.run(
             "autofix", "pre", CI_CONCLUSION="failure", AUTOPILOT_CURRENCY_RETRY_SECONDS="0",
         ))
