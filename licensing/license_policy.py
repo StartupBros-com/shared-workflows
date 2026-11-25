@@ -464,10 +464,17 @@ def pr_body(policy, plan, detected):
             lines.append('- `%s`: %s' % (f.path, f.message))
     lines += ['', 'The copyright line the policy writes is:', '',
               '    Copyright (c) <year> %s' % policy.holder_text, '',
-              'The license text is the unmodified standard text. '
-              'GitHub detects `%s` on this branch.' % (detected or 'nothing')]
-    if plan.first_license:
-        lines += ['', '**This repository had no license.** Merging grants the %s license to '
+              'The license text is the unmodified standard text.']
+    if not plan.first_license:
+        lines[-1] += ' GitHub detects `%s` on this branch.' % (detected or 'nothing')
+    else:
+        # Observed 2026-11-25 on three repositories: GitHub answers 404 for a
+        # branch's license while the default branch has none.
+        lines[-1] += (' GitHub does not report a branch\'s license while the default branch has '
+                      'none, so the next sweep after the merge confirms detection.')
+        lines += ['', 'Every commit author here is an owner login or a bot, and the tree has no '
+                      '`UPSTREAM.md`.',
+                  '', '**This repository had no license.** Merging grants the %s license to '
                       'everyone, and that grant cannot be withdrawn for copies already taken. '
                       'Merge only if this code is meant to be open source.' % policy.license]
     lines += ['', 'To change what the sweep does here, edit `licensing/policy.toml` in '
@@ -518,10 +525,12 @@ def open_pull_request(gh, policy, org, repo, tree, plan, branch):
             'message': 'chore: apply the org license policy', 'tree': new_tree['sha'],
             'parents': [base_sha]})
         gh.post(api + '/git/refs', {'ref': 'refs/heads/' + branch, 'sha': commit['sha']})
-    try:
-        detected = (gh.get('%s/license?ref=%s' % (api, branch)).get('license') or {}).get('spdx_id')
-    except RuntimeError:
-        detected = None
+    detected = None
+    if not plan.first_license:
+        try:
+            detected = (gh.get('%s/license?ref=%s' % (api, branch)).get('license') or {}).get('spdx_id')
+        except RuntimeError:
+            detected = None
     pull = gh.post(api + '/pulls', {
         'title': 'chore: apply the org license policy', 'head': branch,
         'base': repo['default_branch'], 'body': pr_body(policy, plan, detected)})
@@ -579,7 +588,7 @@ def sweep_repo(gh, policy, org, repo, workdir, apply, template):
     if not apply:
         return Row(name, 'would-open-pr', summary, plan.findings, red=True)
     number, seen = open_pull_request(gh, policy, org, repo, tree, plan, branch)
-    if seen != rp.license:
+    if not plan.first_license and seen != rp.license:
         decisions.append(Finding('decide', 'LICENSE', 'GitHub detects %s on %s instead of %s'
                                  % (seen or 'nothing', branch, rp.license)))
     return Row(name, 'pr-opened', '#%d (%s)%s' % (

@@ -338,6 +338,7 @@ class FakeGh:
         self.pulls = pulls or {}
         self.detected_on_branch = detected_on_branch
         self.posts = []
+        self.gets = []
         self.cloned = []
 
     def lines(self, path, jq):
@@ -357,6 +358,7 @@ class FakeGh:
         raise AssertionError('unexpected read: ' + path)
 
     def get(self, path):
+        self.gets.append(path)
         return {'license': {'spdx_id': self.detected_on_branch}}
 
     def post(self, path, body, method='POST'):
@@ -476,6 +478,27 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(tree_body['tree'][0]['content'], mit(OURS.replace('2026', '2025')))
         self.assertIn('stranger', text)
         self.assertEqual(code, 2)
+
+    def test_first_license_branch_is_not_asked_for_its_detected_license(self):
+        # GitHub answered 404 for a branch's license on every repository whose
+        # default branch had none, so asking always looked like a failed detection.
+        self.tree('bare', {'README.md': 'x\n'})
+        gh = FakeGh([repo('bare', license=None)], self.trees, detected_on_branch=None)
+        code, text = self.sweep(gh, apply=True)
+        body = [b for _m, p, b in gh.posts if p.endswith('/pulls')][0]['body']
+        self.assertEqual(gh.gets, [])
+        self.assertNotIn('GitHub detects', text + body)
+        self.assertIn('next sweep after the merge confirms detection', body)
+        self.assertEqual(code, 1)
+
+    def test_changed_license_branch_is_asked_for_its_detected_license(self):
+        self.tree('drift', {'LICENSE': mit('Copyright (c) 2026 Example Holdings')})
+        gh = FakeGh([repo('drift')], self.trees)
+        self.sweep(gh, apply=True)
+        self.assertEqual(len(gh.gets), 1)
+        self.assertIn('/license?ref=chore/license-policy-', gh.gets[0])
+        body = [b for _m, p, b in gh.posts if p.endswith('/pulls')][0]['body']
+        self.assertIn('GitHub detects `MIT` on this branch.', body)
 
     def test_anonymous_commit_authors_block_a_first_license(self):
         self.tree('bare', {'README.md': 'x\n'})
