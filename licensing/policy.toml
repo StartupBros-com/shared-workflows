@@ -1,0 +1,73 @@
+# License policy for every public repository in the org.
+#
+# license_policy.py reads this file and nothing else states the policy. Edit it
+# here; the scheduled sweep opens a pull request in each repository that
+# differs. See README.md in this directory.
+
+[holder]
+# The copyright line the tool writes is:
+#   Copyright (c) <year> <name> (<brand>, <url>)
+# `brand` and `url` are optional. The MIT license requires every copy to keep
+# this line, so it is the one string that travels with the code.
+name = "StartupBros LLC"
+brand = "House of Vibe"
+url = "https://houseofvibe.ai"
+
+# Earlier spellings of the same holder. A copyright line naming one of these is
+# rewritten to the line above. A line naming anyone else is never touched.
+aliases = [
+  "StartupBros",
+  "StartupBros LLC",
+  "StartupBros / House of Vibe",
+]
+
+[defaults]
+license = "MIT"
+
+[provenance]
+# A first LICENSE is only written into a repository when every commit author
+# is one of these GitHub logins or a bot, and the tree has no UPSTREAM.md.
+owner_logins = ["StartupBros"]
+
+[sweep]
+org = "StartupBros-com"
+
+# Per-repository exceptions. Keys:
+#   mode     = "hands-off"   the tool neither checks nor writes; needs a reason
+#   reason   = "..."         why the exception exists
+#   license  = "Apache-2.0"  keep this license instead of the default
+#   subtrees = ["plugins/*"] directories shipped on their own; each gets a copy
+#                            of the root LICENSE if it has no license file
+
+[repos.hov-stack]
+subtrees = ["plugins/*"]
+
+[repos.hov-router]
+mode = "hands-off"
+reason = "Derived from tombii/better-ccflare. Its LICENSE names the upstream holders."
+
+[repos.whoop-mcp]
+mode = "hands-off"
+reason = "Derived from izqui/whoop-mcp. Its LICENSE names the upstream contributors."
+
+[repos.whygraph]
+mode = "hands-off"
+license = "Apache-2.0"
+reason = "Contest entry published as Apache-2.0, judged after 2026-12-11. Holder line reads 'whygraph contributors'."
+
+[repos.plain-english-margin]
+mode = "hands-off"
+license = "Apache-2.0"
+reason = "Contest entry published as Apache-2.0. Leave as submitted until judged."
+
+[repos.synthetic-panel]
+mode = "hands-off"
+reason = "Holder line reads 'synthetic-panel contributors'. Awaiting a decision on naming the holder."
+
+[repos.renpho-mcp-server]
+mode = "hands-off"
+reason = "Holder is an individual and the repository has an outside contributor."
+
+[repos.mac-studio-model-evidence]
+mode = "hands-off"
+reason = "Holder is an individual. Code is MIT and prose is CC BY-ND 4.0."
