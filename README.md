@@ -2,6 +2,11 @@
 
 Org-shared **reusable GitHub Actions workflows** for StartupBros-com.
 
+## `licensing/`
+
+The org's license policy and the script that applies and checks it across every
+public repository. See [`licensing/README.md`](licensing/README.md).
+
 ## `dependency-autopilot.yml`
 
 A shared dependency workflow, called after a repository's PR CI finishes:
