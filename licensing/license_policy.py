@@ -59,8 +59,6 @@ class PolicyError(ValueError):
     """policy.toml is malformed."""
 
 
-# --------------------------------------------------------------------- policy
-
 @dataclasses.dataclass(frozen=True)
 class RepoPolicy:
     hands_off: bool
@@ -143,8 +141,6 @@ def load_policy(path=DEFAULT_POLICY):
         owner_logins=frozenset(provenance.get('owner_logins', ())),
         org=sweep.get('org', ''), repos=repos)
 
-
-# ----------------------------------------------------------------- MIT text
 
 def _norm(text):
     return ' '.join(text.split())
@@ -237,8 +233,6 @@ def render_mit(text, policy, template, default_year):
             n.lead, n.years or default_year, policy.holder_text, n.eol)
     return 'mixed', ''.join(lines), others
 
-
-# ------------------------------------------------------------------- planner
 
 @dataclasses.dataclass
 class Facts:
@@ -419,8 +413,6 @@ def print_plan(plan, out=sys.stdout):
     if not plan.findings and not plan.hands_off:
         print('conforms', file=out)
 
-
-# --------------------------------------------------------------------- sweep
 
 class Gh:
     """The GitHub calls the sweep makes, kept in one place so tests can swap it."""
@@ -632,8 +624,6 @@ def sweep(gh, policy, apply=False, only=(), out=sys.stdout, workdir=None):
         return 2
     return 1 if red else 0
 
-
-# ----------------------------------------------------------------------- CLI
 
 def repo_name(tree, given):
     if given:
