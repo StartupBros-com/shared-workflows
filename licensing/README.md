@@ -23,6 +23,47 @@ travels with the code wherever it is vendored or repackaged. Nothing else in a
 LICENSE file is addressed to people or to coding agents, and nothing asks for
 more than MIT already requires.
 
+## Why this policy
+
+The alternative considered was a custom license that requires visible credit
+and sells permission to remove it. Before choosing, coding agents were given
+ordinary jobs across ten license shapes: pick one of two libraries, vendor and
+publish it, write a client handoff, deliver it under a client's name. 456
+scored runs on 2026-11-25: 408 with Claude Sonnet and Opus, 48 with Codex.
+
+- **Choosing.** When the library under test had a feature the job needed,
+  Claude picked it 12 of 12 times under plain MIT and 12 of 12 under the line
+  this policy writes, and 0 of 12 under the custom attribution license and 0 of
+  12 under the Attribution Assurance License. Codex: 6 of 6, 6 of 6 and 0 of 6
+  (it was not run on the fourth). With the custom license the agents wrote the
+  missing feature on the other library instead.
+- **Ties.** Between two libraries that tie exactly, a brand and a URL in the
+  copyright line never cost the agent's default pick (8 of 8 with Claude, 3 of
+  3 with Codex). The one MIT shape that did lose ties (3 of 6) added a tagline
+  to the copyright line and a README section asking for credit. The runs do not
+  say which of the two cost it, so the line stays short and the tool writes
+  nothing into a README.
+- **Carrying.** The URL in the copyright line was inside the published npm
+  package in 4 of 4 runs, against 1 of 6 for plain MIT. The license file is the
+  carrier: it was vendored in all 296 runs where an agent chose a library.
+- **Keeping.** Asked to deliver under a client's name, agents kept the custom
+  license's visible credit in 3 of 6 runs.
+- GitHub labels any license text it cannot match to a standard one as "Other".
+
+Limits: one kind of task (a small JavaScript library, a feature an agent can
+write in a few lines) and 3 to 12 runs per cell. The runs cover a component an
+agent chooses or carries. They do not cover a finished product that a person
+asks for by name. A custom license for one such product is worth revisiting if
+people start asking to remove the branding. Do not add one here without new
+evidence.
+
+Apache-2.0 lost every exact tie and won every run where it had the feature, so
+a repository that is already Apache-2.0 stays that way until the policy says
+otherwise.
+
+The harness, the plans written before each batch and the per-run scores are
+kept with the decision report, outside this repository.
+
 ## Commands
 
     python3 licensing/license_policy.py check <tree> [--repo NAME]
