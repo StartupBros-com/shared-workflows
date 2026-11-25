@@ -47,7 +47,12 @@ scored runs on 2026-11-25: 408 with Claude Sonnet and Opus, 48 with Codex.
   package in 4 of 4 runs, against 1 of 6 for plain MIT. The license file is the
   carrier: it was vendored in all 296 runs where an agent chose a library.
 - **Keeping.** Asked to deliver under a client's name, agents kept the custom
-  license's visible credit in 3 of 6 runs.
+  license's visible credit in 3 of 6 runs. In the other 3 they obeyed the
+  license a different way: they removed the library and wrote their own
+  replacement, so no credit was owed. Under the Attribution Assurance License
+  5 of 6 did the same. Under every MIT and Apache shape the library stayed in
+  6 of 6 runs, with its copyright line still in the delivered files. An
+  attribution license trades installs for credits.
 - GitHub labels any license text it cannot match to a standard one as "Other".
 
 Limits: one kind of task (a small JavaScript library, a feature an agent can
