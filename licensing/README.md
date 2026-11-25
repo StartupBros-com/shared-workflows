@@ -40,6 +40,12 @@ repository that differs, built through the GitHub API on a branch named after a
 digest of the change, so a second run finds the first run's pull request
 instead of opening another. It never merges.
 
+Each pull request that changes an existing license says what GitHub detects on
+its branch, and a mismatch is reported as a decision. A first-license pull
+request cannot say that: GitHub answered 404 for the branch's license on every
+repository whose default branch had none (seen on three, 2026-11-25). The sweep
+after the merge checks the default branch instead.
+
 Exit codes: `0` conforms, `1` differs and the tool can fix it (or a pull
 request is waiting for a merge), `2` something needs a decision.
 
