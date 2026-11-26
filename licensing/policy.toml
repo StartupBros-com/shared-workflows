@@ -19,6 +19,8 @@ aliases = [
   "StartupBros",
   "StartupBros LLC",
   "StartupBros / House of Vibe",
+  # The placeholder synthetic-panel was published with. Every commit there is ours.
+  "synthetic-panel contributors",
 ]
 
 [defaults]
@@ -54,7 +56,3 @@ reason = "Contest entry published as Apache-2.0, judged after 2026-12-11. Holder
 mode = "hands-off"
 license = "Apache-2.0"
 reason = "Contest entry published as Apache-2.0. Leave as submitted until judged."
-
-[repos.synthetic-panel]
-mode = "hands-off"
-reason = "Its release gate (scripts/release_gate.sh) fails on the company name anywhere in its files, so the holder line stays 'synthetic-panel contributors' until that gate is changed or the line is left for good."
