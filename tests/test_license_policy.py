@@ -268,6 +268,39 @@ class NestedAndSubtreeTests(TreeCase):
         self.assertEqual(plan.writes, {})
 
 
+class LicenseLinkTests(TreeCase):
+    def track_fixture(self):
+        subprocess.run(['git', '-C', self.tree, 'init', '-q'], check=True)
+        subprocess.run(['git', '-C', self.tree, 'add', '-A'], check=True)
+
+    def test_tracked_root_license_link_is_not_treated_as_first_license(self):
+        self.put('terms.txt', 'existing terms\n')
+        Path(self.tree, 'LICENSE').symlink_to('terms.txt')
+        self.track_fixture()
+        plan = self.plan(owner=lambda: self.fail('not a first license'))
+        self.assertFalse(plan.first_license)
+        self.assertEqual(plan.writes, {})
+        self.assertEqual([f.path for f in plan.decisions], ['LICENSE'])
+
+    def test_dangling_license_link_blocks_subtree_license_copy(self):
+        self.put('LICENSE', mit(OURS))
+        self.put('plugins/a/plugin.json', '{}\n')
+        Path(self.tree, 'plugins/a/LICENSE').symlink_to('terms.txt')
+        self.track_fixture()
+        plan = self.plan(repos={'demo': {'subtrees': ['plugins/*']}})
+        self.assertEqual(plan.writes, {})
+        self.assertEqual([f.path for f in plan.decisions], ['plugins/a/LICENSE'])
+
+    def test_alternate_license_link_counts_as_an_existing_subtree_license(self):
+        self.put('LICENSE', mit(OURS))
+        self.put('plugins/a/plugin.json', '{}\n')
+        self.put('plugins/a/terms.txt', 'existing terms\n')
+        Path(self.tree, 'plugins/a/COPYING').symlink_to('terms.txt')
+        plan = self.plan(repos={'demo': {'subtrees': ['plugins/*']}})
+        self.assertEqual(plan.writes, {})
+        self.assertEqual([f.path for f in plan.decisions], ['plugins/a/COPYING'])
+
+
 class PolicyEntryTests(TreeCase):
     def test_hands_off_repository_is_neither_checked_nor_written(self):
         self.put('LICENSE', mit('Copyright (c) 2026 Example Holdings'))
