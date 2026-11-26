@@ -92,6 +92,15 @@ request cannot say that: GitHub answered 404 for the branch's license on every
 repository whose default branch had none (seen on three, 2026-11-25). The sweep
 after the merge checks the default branch instead.
 
+One layout gets a different question. Where the root holds a second license
+file (`REPORT-LICENSE.md` beside `LICENSE`), GitHub names the license only for
+the default branch asked for by name. Every other branch reads `NOASSERTION`,
+and so does the default branch's own commit asked for by its id (seen on
+`mac-studio-model-evidence` and `pi-evals-evidence`, 2026-11-26). A change
+cannot move that answer, so there the sweep asks whether the branch reads the
+same as the commit it was cut from, and relies on its own exact comparison of
+the license text. The pull request says so.
+
 Exit codes: `0` conforms, or a pull request is waiting for a later run to
 merge it. `1` differs and the tool can fix it (report mode, or merging switched
 off), or a pull request was refused or has waited three days. `2` something
@@ -119,7 +128,12 @@ pass.
 5. Its changed files are exactly the files the plan writes, with exactly the
    planned content. Anything pushed to the branch afterwards stops the merge.
 6. GitHub detects the policy license on the branch. A first license is not
-   asked this, for the reason given above.
+   asked this, for the reason given above. A branch on which GitHub names no
+   license (`NOASSERTION`) passes only when all of these hold: the commit it
+   was cut from reads `NOASSERTION` too when asked for by its id, GitHub names
+   the policy license on the default branch, the policy license is MIT, and
+   every file the pull request writes is the exact MIT text. Any other answer,
+   and any read that fails, refuses.
 7. No check failed, none is still running, and every check the default branch
    requires has reported. The sweep waits for running checks for up to four
    minutes per run, shared across all repositories.
@@ -150,6 +164,12 @@ What the guards cannot know:
   guard 2 is all that tells "has no checks" from "checks have not started".
   Requiring a check on that branch removes the guess: guard 7 then waits for
   it by name.
+- In a repository with a second license file in its root, GitHub does not
+  confirm the license on any branch but the default one, before or after a
+  change. Guard 6 there rests on the tool's own comparison of the text with
+  the standard MIT text, and on GitHub still naming the license on the default
+  branch. The sweep after the merge reads the default branch again and reports
+  a decision if GitHub no longer names it.
 
 ## What it will not do
 
@@ -164,6 +184,10 @@ What the guards cannot know:
   only the sweep writes a first LICENSE, and its pull request says that merging
   is a grant that cannot be taken back.
 - Reopen a pull request someone closed. It reports the closed one instead.
+- Make the same change twice. If its pull request for a change already merged
+  and the file differs again, someone changed it back. It reports that as a
+  decision and opens nothing: put the file right by hand, or add a
+  `[repos.NAME]` entry if the difference is meant.
 - Edit a package manifest. A `package.json` or `pyproject.toml` whose license
   field disagrees with the LICENSE is reported.
 - Name a private repository. Private ones are counted and nothing more.

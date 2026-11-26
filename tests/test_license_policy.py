@@ -10,6 +10,7 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -346,6 +347,7 @@ class OwnRepositoryTests(unittest.TestCase):
 
 NOW = datetime.datetime(2026, 11, 26, 12, 0, 0, tzinfo=datetime.timezone.utc)
 HEAD_SHA = 'a' * 40
+BASE_SHA = 'c' * 40
 
 
 def ago(hours=0, minutes=0):
@@ -388,7 +390,7 @@ class Scenario:
             'created_at': ago(age_hours, age_minutes),
             'updated_at': (ago(age_hours, age_minutes) if quiet_minutes is None
                            else ago(minutes=quiet_minutes)),
-            'base': {'ref': default_branch},
+            'base': {'ref': default_branch, 'sha': BASE_SHA},
             'head': {'ref': branch, 'sha': HEAD_SHA, 'repo': {'full_name': 'example-org/' + name}}}
         self.files = [{'filename': path, 'status': 'added', 'sha': git_blob(text)}
                       for path, text in writes.items()]
@@ -404,14 +406,19 @@ class Scenario:
 class FakeGh:
     """Recorded GitHub answers; records every write the sweep attempts."""
 
-    def __init__(self, repos, trees, contributors=None, pulls=None, detected_on_branch='MIT'):
+    def __init__(self, repos, trees, contributors=None, pulls=None, detected_on_branch='MIT',
+                 detected_by_id='MIT'):
         self.repos, self.trees = repos, trees
         self.contributors = contributors or {}
         self.pulls = pulls or {}
+        # What GitHub names for a branch asked for by name, and for a commit asked
+        # for by id. An exception in either place is raised by that read.
         self.detected_on_branch = detected_on_branch
+        self.detected_by_id = detected_by_id
         self.posts = []
         self.gets = []
         self.cloned = []
+        self.cloned_to = {}
         self.scripts = {}       # repository name -> Scenario, see arm()
         self.fail = set()       # a request whose path ends with one of these raises
         self.unexpected = []    # reads the fake has no answer for; SweepCase.sweep checks it
@@ -456,7 +463,11 @@ class FakeGh:
         base = path.split('?')[0]
         scenario = self.scripts.get(path.split('/')[2]) if path.startswith('repos/') else None
         if scenario is None or '/license' in base:
-            return {'license': {'spdx_id': self.detected_on_branch}}
+            by_id = re.fullmatch(r'[0-9a-f]{40}', path.partition('?ref=')[2]) is not None
+            answer = self.detected_by_id if by_id else self.detected_on_branch
+            if isinstance(answer, Exception):
+                raise answer
+            return {'license': {'spdx_id': answer}}
         if base.endswith('/files'):
             return scenario.files
         if base.endswith('/reviews'):
@@ -490,6 +501,7 @@ class FakeGh:
 
     def clone(self, org, name, dest):
         self.cloned.append(name)
+        self.cloned_to[name] = dest
         shutil.copytree(self.trees[name], dest)
         git = ['git', '-C', dest, '-c', 'user.name=t', '-c', 'user.email=t@example.test']
         subprocess.run(['git', '-C', dest, 'init', '--quiet'], check=True)
@@ -664,11 +676,38 @@ class SweepTests(SweepCase):
         self.assertEqual(code, 2)
 
     def test_branch_that_github_does_not_detect_is_flagged(self):
+        # The commit the branch starts from reads MIT when asked for by id, so
+        # the change is what lost the license.
         self.tree('drift', {'LICENSE': mit('Copyright (c) 2026 Example Holdings')})
         gh = FakeGh([repo('drift')], self.trees, detected_on_branch='NOASSERTION')
         code, text = self.sweep(gh, apply=True)
         self.assertIn('GitHub detects NOASSERTION on chore/license-policy-', text)
         self.assertEqual(code, 2)
+        self.assertEqual(len([p for p in gh.gets if '/license?ref=' in p]), 2)
+        body = [b for _m, p, b in gh.posts if p.endswith('/pulls')][0]['body']
+        self.assertIn('GitHub detects `NOASSERTION` on this branch.', body)
+
+    def test_a_second_license_file_in_the_root_is_not_a_decision_on_the_opening_run(self):
+        # Seen 2026-11-26 on two repositories holding LICENSE and REPORT-LICENSE.md:
+        # GitHub names the license only for the default branch asked for by name.
+        # Every other ref reads NOASSERTION, that branch's own commit by id included.
+        self.tree('drift', {'LICENSE': mit('Copyright (c) 2026 Example Holdings'),
+                            'REPORT-LICENSE.md': 'Notes: CC BY-ND 4.0\n'})
+        gh = FakeGh([repo('drift')], self.trees, detected_on_branch='NOASSERTION',
+                    detected_by_id='NOASSERTION')
+        code, text = self.sweep(gh, apply=True)
+        self.assertNotIn('GitHub detects', text)
+        self.assertNotIn('decide', text)
+        self.assertIn('pr-opened      #7 (1 file(s))', text)
+        self.assertEqual(code, 1)
+        base = subprocess.run(['git', '-C', gh.cloned_to['drift'], 'rev-parse', 'HEAD'],
+                              check=True, capture_output=True, text=True).stdout.strip()
+        self.assertEqual([p.partition('/license?ref=')[2] for p in gh.gets],
+                         [lp.BRANCH_PREFIX + lp.digest_of({'LICENSE': mit(OURS)}), base])
+        body = [b for _m, p, b in gh.posts if p.endswith('/pulls')][0]['body']
+        self.assertIn('GitHub names no license on this branch, and none on the commit it '
+                      'starts from', body)
+        self.assertNotIn('GitHub detects', body)
 
     def test_hands_off_repository_is_listed_with_its_reason_and_not_cloned(self):
         self.tree('theirs', {'LICENSE': mit('Copyright (c) 2020 Upstream')})
@@ -758,11 +797,16 @@ class MergeTests(SweepCase):
         return gh, gh.arm(name, branch, writes, age_hours=age_hours, age_minutes=age_minutes,
                           quiet_minutes=quiet_minutes, default_branch=default_branch), name
 
-    def direct(self, gh, sc, license_wanted='MIT', **kwargs):
+    def direct(self, gh, sc, license_wanted='MIT', repo_license='MIT', writes=None, **kwargs):
         """try_merge on its own, for what a whole sweep cannot reach or would hide."""
-        plan = types.SimpleNamespace(writes={'LICENSE': mit(OURS)}, first_license=False)
+        plan = types.SimpleNamespace(writes=writes or {'LICENSE': mit(OURS)},
+                                     first_license=False)
+        if writes:
+            sc.files = [{'filename': path, 'status': 'modified', 'sha': git_blob(text)}
+                        for path, text in writes.items()]
         return lp.try_merge(gh, policy({'drift': {'license': license_wanted}}, merge=True),
-                            'example-org', repo('drift'), plan, sc.pull['head']['ref'], 12, [],
+                            'example-org', repo('drift', license=repo_license), plan,
+                            sc.pull['head']['ref'], 12, [],
                             lp.WaitBudget(self.sleeps.append), **kwargs)
 
     def run_merge(self, gh, during_wait=None):
@@ -989,10 +1033,93 @@ class MergeTests(SweepCase):
         self.assertIn('#12 not merged: merge refused: more than 100 entries at ', text)
 
     def test_wrong_license_detected_on_the_branch_refuses(self):
-        gh, _sc, _name = self.case()
+        # The base commit reads MIT by id, so the branch is what lost the license.
+        gh, sc, _name = self.case()
         gh.detected_on_branch = 'NOASSERTION'
         _code, text, status = self.run_merge(gh)
         self.assertRefused(gh, text, status, 'GitHub does not detect MIT on the branch')
+        self.assertEqual([p.partition('/license?ref=')[2] for p in gh.gets if '/license' in p],
+                         [sc.pull['head']['ref'], BASE_SHA])
+
+    def two_license_case(self, **over):
+        """A root with a second license file: every ref but the default branch by name
+        reads NOASSERTION, the base commit asked for by id included."""
+        gh, sc, name = self.case(extra={'REPORT-LICENSE.md': 'Notes: CC BY-ND 4.0\n'}, **over)
+        gh.detected_on_branch = gh.detected_by_id = 'NOASSERTION'
+        return gh, sc, name
+
+    def test_a_second_license_file_in_the_root_does_not_stop_the_merge(self):
+        gh, sc, _name = self.two_license_case()
+        code, text, status = self.run_merge(gh)
+        self.assertEqual(gh.merge_calls(),
+                         [('PUT', 'repos/example-org/drift/pulls/12/merge', self.PUT_BODY)])
+        self.assertEqual((code, status), (0, 'merged'))
+        self.assertEqual([p.partition('/license?ref=')[2] for p in gh.gets if '/license' in p],
+                         [sc.pull['head']['ref'], BASE_SHA])
+
+    def test_a_second_license_file_in_the_root_opens_and_waits_without_a_decision(self):
+        gh, _sc, _name = self.two_license_case(existing=False)
+        code, text, status = self.run_merge(gh)
+        self.assertNoMerge(gh)
+        self.assertEqual((code, status), (0, 'pr-opened'))
+        self.assertIn('#7 waits: opened in this run: a later run merges it (1 file(s))', text)
+        self.assertNotIn('decide', text)
+
+    def test_only_no_license_named_on_both_the_branch_and_its_base_is_accepted(self):
+        # (branch by name, base commit by id). A read that fails never equals
+        # another, and a different license is not the layout this allows for.
+        boom = RuntimeError('gh api failed: boom')
+        for on_branch, by_id in (('NOASSERTION', 'MIT'), ('NOASSERTION', None),
+                                 ('NOASSERTION', boom), ('NOASSERTION', 'Apache-2.0'),
+                                 ('Apache-2.0', 'Apache-2.0'), ('Apache-2.0', 'NOASSERTION'),
+                                 (None, None), (None, 'NOASSERTION'), (boom, boom),
+                                 (boom, 'NOASSERTION')):
+            with self.subTest(on_branch=on_branch, by_id=by_id):
+                gh, sc, _name = self.two_license_case()
+                gh.detected_on_branch, gh.detected_by_id = on_branch, by_id
+                outcome = self.direct(gh, sc, now=NOW)
+                self.assertEqual((outcome.status, outcome.reason, gh.merge_calls()),
+                                 ('refused', 'GitHub does not detect MIT on the branch', []))
+
+    def test_a_second_license_file_is_no_excuse_when_the_default_branch_names_no_license(self):
+        for named in ('NOASSERTION', None, 'Apache-2.0'):
+            with self.subTest(named=named):
+                gh, sc, _name = self.two_license_case()
+                outcome = self.direct(gh, sc, repo_license=named, now=NOW)
+                self.assertEqual((outcome.status, outcome.reason, gh.merge_calls()),
+                                 ('refused', 'GitHub does not detect MIT on the branch', []))
+
+    def test_a_second_license_file_is_no_excuse_for_a_license_this_tool_cannot_check_exactly(self):
+        # Only the MIT parse compares the whole text. Apache is a phrase match.
+        gh, sc, _name = self.two_license_case()
+        outcome = self.direct(gh, sc, license_wanted='Apache-2.0', repo_license='Apache-2.0',
+                              now=NOW)
+        self.assertEqual((outcome.status, outcome.reason, gh.merge_calls()),
+                         ('refused', 'GitHub does not detect Apache-2.0 on the branch', []))
+
+    def test_a_second_license_file_is_no_excuse_for_a_planned_file_that_is_not_the_mit_text(self):
+        # The exact-text check is what stands in for GitHub's confirmation.
+        for path in ('LICENSE', 'plugins/x/LICENSE'):
+            with self.subTest(path=path):
+                gh, sc, _name = self.two_license_case()
+                writes = {'LICENSE': mit(OURS), path: mit(OURS).replace('WITHOUT WARRANTY',
+                                                                       'WITH WARRANTY')}
+                outcome = self.direct(gh, sc, writes=writes, now=NOW)
+                self.assertEqual((outcome.status, outcome.reason, gh.merge_calls()),
+                                 ('refused', 'GitHub does not detect MIT on the branch', []))
+        gh, sc, _name = self.two_license_case()
+        self.assertEqual(self.direct(gh, sc, writes={'LICENSE': mit(OURS)}, now=NOW).status,
+                         'merged')
+
+    def test_a_pull_request_without_a_base_commit_is_never_excused(self):
+        for base in ({'ref': 'main'}, {'ref': 'main', 'sha': ''}, {'ref': 'main', 'sha': None}):
+            with self.subTest(base=base):
+                gh, sc, _name = self.two_license_case()
+                sc.pull['base'] = base
+                outcome = self.direct(gh, sc, now=NOW)
+                self.assertEqual((outcome.status, outcome.reason, gh.merge_calls()),
+                                 ('refused', 'GitHub does not detect MIT on the branch', []))
+                self.assertEqual(len([p for p in gh.gets if '/license' in p]), 1)
 
     def test_failed_license_lookup_refuses(self):
         gh, _sc, _name = self.case()

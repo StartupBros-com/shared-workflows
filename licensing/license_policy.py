@@ -63,6 +63,7 @@ SKIP_DIRS = ('.git', 'node_modules')
 FIRST_LICENSE_HOLD_HOURS = 20       # a first LICENSE never merges younger than this
 SETTLE_MINUTES = 10                 # nothing merges this soon after its last change
 STALE_HOURS = 72                    # a pull request still waiting after this is red
+UNNAMED = 'NOASSERTION'             # GitHub found license files and names no license
 WAIT_TOTAL_SECONDS = 240            # one budget for checks, shared by the whole sweep
 WAIT_STEP_SECONDS = 15
 
@@ -472,7 +473,7 @@ def digest_of(writes):
     return hashlib.sha256(blob).hexdigest()[:10]
 
 
-def pr_body(policy, plan, detected):
+def pr_body(policy, plan, detected, same_as_base=False):
     lines = ['Opened by the org license sweep (`licensing/` in shared-workflows).', '',
              'What changes:', '']
     for f in plan.findings:
@@ -481,7 +482,12 @@ def pr_body(policy, plan, detected):
     lines += ['', 'The copyright line the policy writes is:', '',
               '    Copyright (c) <year> %s' % policy.holder_text, '',
               'The license text is the unmodified standard text.']
-    if not plan.first_license:
+    if same_as_base:
+        lines[-1] += (' GitHub names no license on this branch, and none on the commit it '
+                      'starts from when that is asked for by id: it names one here only for '
+                      'the default branch, as it does when the root holds a second license '
+                      'file. This change does not alter that.')
+    elif not plan.first_license:
         lines[-1] += ' GitHub detects `%s` on this branch.' % (detected or 'nothing')
     else:
         # Observed 2026-11-25 on three repositories: GitHub answers 404 for a
@@ -530,8 +536,50 @@ def sole_owner_check(gh, policy, org, name):
     return check
 
 
-def open_pull_request(gh, policy, org, repo, tree, plan, branch):
-    """Create the branch and pull request through the API. Returns (number, detected)."""
+def _detected(gh, api, ref):
+    """The license GitHub names for one ref, or None when the read fails."""
+    try:
+        return (gh.get('%s/license?ref=%s' % (api, ref)).get('license') or {}).get('spdx_id')
+    except RuntimeError:
+        return None
+
+
+def branch_detection(gh, policy, repo, api, plan, branch, base_sha, template=None):
+    """What GitHub names on a license branch, and whether that stops the change.
+
+    Returns (seen, accepted). The branch should read as the repository's policy
+    license, and one layout cannot. With a second license file in the root
+    (REPORT-LICENSE.md beside LICENSE) GitHub names the license only for the
+    default branch asked for by name. Every other ref reads NOASSERTION, the
+    default branch's own commit asked for by id included (seen 2026-11-26 on
+    mac-studio-model-evidence and pi-evals-evidence). There a change cannot
+    move GitHub's answer, so it cannot be asked to confirm one. The answer is
+    accepted only when all of this holds:
+
+    - the branch reads exactly NOASSERTION, and so does the commit it was cut
+      from, asked for by id: a read that fails never equals another;
+    - GitHub names the policy license on the default branch;
+    - the policy license is MIT and every file the plan writes is the exact
+      MIT text by this tool's own parse, which is what stands in for GitHub's
+      confirmation. The Apache check is a phrase match and cannot.
+    """
+    want = policy.for_repo(repo['name']).license
+    seen = _detected(gh, api, branch)
+    if seen == want:
+        return seen, True
+    template = template or mit_template()
+    accepted = (seen == UNNAMED and want == 'MIT' and repo.get('license') == want
+                and all(parse_mit(text, template) is not None for text in plan.writes.values())
+                and bool(base_sha) and _detected(gh, api, base_sha) == UNNAMED)
+    return seen, accepted
+
+
+def open_pull_request(gh, policy, org, repo, tree, plan, branch, template=None):
+    """Create the branch and pull request through the API.
+
+    Returns (number, detected, accepted): what GitHub names on the new branch
+    and whether branch_detection accepts it. Both are None for a first license.
+    """
     name = repo['name']
     base_sha = _git(tree, 'rev-parse', 'HEAD')
     base_tree = _git(tree, 'rev-parse', 'HEAD^{tree}')
@@ -548,15 +596,15 @@ def open_pull_request(gh, policy, org, repo, tree, plan, branch):
             'message': 'chore: apply the org license policy', 'tree': new_tree['sha'],
             'parents': [base_sha]})
         gh.post(api + '/git/refs', {'ref': 'refs/heads/' + branch, 'sha': commit['sha']})
-    detected = None
+    detected = accepted = None
     if not plan.first_license:
-        try:
-            detected = (gh.get('%s/license?ref=%s' % (api, branch)).get('license') or {}).get('spdx_id')
-        except RuntimeError:
-            detected = None
+        detected, accepted = branch_detection(gh, policy, repo, api, plan, branch, base_sha,
+                                              template)
     pull = gh.post(api + '/pulls', {
         'title': 'chore: apply the org license policy', 'head': branch,
-        'base': repo['default_branch'], 'body': pr_body(policy, plan, detected)})
+        'base': repo['default_branch'],
+        'body': pr_body(policy, plan, detected,
+                        same_as_base=bool(accepted) and detected == UNNAMED)})
     stale = gh.lines(api + '/pulls?state=open&per_page=100',
                      '.[] | select(.head.repo.full_name == "%s/%s") | [.number, .head.ref]'
                      % (org, name))
@@ -565,7 +613,7 @@ def open_pull_request(gh, policy, org, repo, tree, plan, branch):
             gh.post('%s/issues/%d/comments' % (api, number),
                     {'body': 'Superseded by #%d: the policy changed.' % pull['number']})
             gh.post('%s/pulls/%d' % (api, number), {'state': 'closed'}, method='PATCH')
-    return pull['number'], detected
+    return pull['number'], detected, accepted
 
 
 class WaitBudget:
@@ -700,7 +748,7 @@ def _dig(value, *keys):
 
 
 def _merge_decision(gh, policy, org, repo, plan, branch, number, decisions, budget, now,
-                    opened_now):
+                    opened_now, template=None):
     name = repo['name']
     api = 'repos/%s/%s' % (org, name)
     first_wait = ('first license: merges once the pull request is %d hours old'
@@ -763,13 +811,11 @@ def _merge_decision(gh, policy, org, repo, plan, branch, number, decisions, budg
             or any(f['sha'] != blob_id(plan.writes[f['filename']]) for f in files)):
         return refuse('its files no longer match the plan')
     if not plan.first_license:
-        want = policy.for_repo(name).license
-        try:
-            seen = (gh.get('%s/license?ref=%s' % (api, branch)).get('license') or {}).get('spdx_id')
-        except RuntimeError:
-            seen = None
-        if seen != want:
-            return refuse('GitHub does not detect %s on the branch' % want)
+        _seen, accepted = branch_detection(gh, policy, repo, api, plan, branch,
+                                           (pull.get('base') or {}).get('sha'), template)
+        if not accepted:
+            return refuse('GitHub does not detect %s on the branch'
+                          % policy.for_repo(name).license)
     rules = _read_list(gh, '%s/rules/branches/%s' % (api, repo['default_branch']))
     required = [check['context'] for rule in rules if rule.get('type') == 'required_status_checks'
                 for check in rule['parameters']['required_status_checks']]
@@ -817,7 +863,7 @@ def _merge_decision(gh, policy, org, repo, plan, branch, number, decisions, budg
 
 
 def try_merge(gh, policy, org, repo, plan, branch, number, decisions, budget, now=None,
-              opened_now=False):
+              opened_now=False, template=None):
     """Merge the sweep's own pull request when every guard holds.
 
     A wrong merge of a first LICENSE grants MIT to the world and cannot be
@@ -827,7 +873,7 @@ def try_merge(gh, policy, org, repo, plan, branch, number, decisions, budget, no
     now = now or datetime.datetime.now(datetime.timezone.utc)
     try:
         return _merge_decision(gh, policy, org, repo, plan, branch, number, decisions, budget,
-                               now, opened_now)
+                               now, opened_now, template)
     except RuntimeError as exc:
         return _refused(exc)
     except (KeyError, TypeError, ValueError, AttributeError, IndexError) as exc:
@@ -886,7 +932,7 @@ def sweep_repo(gh, policy, org, repo, workdir, apply, template, budget=None, now
         if state == 'open':
             if merging:
                 outcome = try_merge(gh, policy, org, repo, plan, branch, number, decisions,
-                                    budget, now)
+                                    budget, now, template=template)
                 return merge_row(name, 'pr-open', number, outcome, summary,
                                  plan.first_license, decisions)
             return Row(name, 'pr-open', '#%d waits for a merge (%s)' % (number, summary),
@@ -899,13 +945,14 @@ def sweep_repo(gh, policy, org, repo, workdir, apply, template, budget=None, now
                    decisions + [Finding('decide', 'LICENSE', why)], red=True)
     if not apply:
         return Row(name, 'would-open-pr', summary, plan.findings, red=True)
-    number, seen = open_pull_request(gh, policy, org, repo, tree, plan, branch)
-    if not plan.first_license and seen != rp.license:
+    number, seen, accepted = open_pull_request(gh, policy, org, repo, tree, plan, branch,
+                                               template)
+    if not plan.first_license and not accepted:
         decisions.append(Finding('decide', 'LICENSE', 'GitHub detects %s on %s instead of %s'
                                  % (seen or 'nothing', branch, rp.license)))
     if merging:
         outcome = try_merge(gh, policy, org, repo, plan, branch, number, decisions, budget, now,
-                            opened_now=True)
+                            opened_now=True, template=template)
         return merge_row(name, 'pr-opened', number, outcome, summary, plan.first_license,
                          decisions)
     return Row(name, 'pr-opened', '#%d (%s)%s' % (
