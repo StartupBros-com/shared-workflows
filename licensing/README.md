@@ -108,9 +108,10 @@ decides, and a read that fails or answers oddly counts as a refusal, never as a
 pass.
 
 1. No decision is open for the repository.
-2. It was not opened in this run, and it is at least 10 minutes old. Checks
-   start a moment after a pull request exists. Until they do, GitHub lists
-   none, which reads the same as all green.
+2. It was not opened in this run, and nothing about it has changed in the last
+   10 minutes. Checks start a moment after a pull request is opened or its
+   branch gets a new commit ("Update branch" counts). Until they do, GitHub
+   lists none, which reads the same as all green.
 3. A first license has been open for at least 20 hours, so there is a day in
    which someone can close it.
 4. It is open, is not a draft, targets the default branch, and its branch is
@@ -130,16 +131,24 @@ branch has a merge queue, the pull request is added to the queue instead.
 In the report, `merged` and `queued` say what was done. `waits: <why>` means
 the next run tries again, and it is not counted as a failure until the pull
 request is three days old. `not merged: <why>` means a guard refused, and the
-run ends non-zero.
+run ends non-zero. A reason that ends "the pull request may have merged" means
+the merge call went out and its answer was missing or made no sense: look at
+the pull request.
 
 To stop one merge, close the pull request or mark it as a draft. To stop all
 of them, remove `merge = true`.
 
-What the guards cannot know: the author check on a first license reads who
-committed, not where the code came from. Code copied from elsewhere and
-committed by an owner login passes it, unless the tree has an `UPSTREAM.md`.
-A private repository is never touched, so a first license only reaches a
-repository that someone made public.
+What the guards cannot know:
+
+- The author check on a first license reads who committed, not where the code
+  came from. Code copied from elsewhere and committed by an owner login passes
+  it, unless the tree has an `UPSTREAM.md`. A private repository is never
+  touched, so a first license only reaches a repository that someone made
+  public.
+- On a repository whose default branch requires no checks, the 10 minutes in
+  guard 2 is all that tells "has no checks" from "checks have not started".
+  Requiring a check on that branch removes the guess: guard 7 then waits for
+  it by name.
 
 ## What it will not do
 

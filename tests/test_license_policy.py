@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
 from unittest import mock
 
@@ -368,11 +369,17 @@ class Scenario:
     """What GitHub says about one pull request. Every field is a plain attribute that a
     test may change after arm(); the defaults describe a pull request that merges."""
 
-    def __init__(self, name, branch, writes, age_hours=1, age_minutes=0):
+    def __init__(self, name, branch, writes, age_hours=1, age_minutes=0, quiet_minutes=None,
+                 default_branch='main'):
+        # quiet_minutes: how long ago the pull request last changed, when that is
+        # later than when it was opened.
+        self.default_branch = default_branch
         self.pull = {
             'state': 'open', 'draft': False, 'node_id': 'PR_node_1',
             'created_at': ago(age_hours, age_minutes),
-            'base': {'ref': 'main'},
+            'updated_at': (ago(age_hours, age_minutes) if quiet_minutes is None
+                           else ago(minutes=quiet_minutes)),
+            'base': {'ref': default_branch},
             'head': {'ref': branch, 'sha': HEAD_SHA, 'repo': {'full_name': 'example-org/' + name}}}
         self.files = [{'filename': path, 'status': 'added', 'sha': git_blob(text)}
                       for path, text in writes.items()]
@@ -398,11 +405,18 @@ class FakeGh:
         self.cloned = []
         self.scripts = {}       # repository name -> Scenario, see arm()
         self.fail = set()       # a request whose path ends with one of these raises
+        self.unexpected = []    # reads the fake has no answer for; SweepCase.sweep checks it
 
     def arm(self, name, branch, writes, **over):
         """Script the pull request the sweep will find or open on `branch`."""
         self.scripts[name] = Scenario(name, branch, writes, **over)
         return self.scripts[name]
+
+    def _unexpected(self, path):
+        # Recorded as well as raised: the sweep turns an exception inside one
+        # repository into a row, and the test must still fail.
+        self.unexpected.append(path)
+        raise AssertionError('unexpected read: ' + path)
 
     def _maybe_fail(self, path):
         if any(path.split('?')[0].endswith(tail) for tail in self.fail):
@@ -425,7 +439,7 @@ class FakeGh:
         if '/pulls?state=open' in path:
             return [[n, ref] for (repo, ref), rows in self.pulls.items() if repo == name
                     for n, state, _m in rows if state == 'open']
-        raise AssertionError('unexpected read: ' + path)
+        self._unexpected(path)
 
     def get(self, path):
         self.gets.append(path)
@@ -445,11 +459,11 @@ class FakeGh:
         if base.endswith('/status'):
             return {'state': 'pending', 'total_count': len(scenario.statuses),
                     'statuses': scenario.statuses}
-        if '/rules/branches/' in base:
+        if base.endswith('/rules/branches/' + scenario.default_branch):
             return scenario.rules
         if '/pulls/' in base:
             return scenario.pull
-        raise AssertionError('unexpected read: ' + path)
+        self._unexpected(path)
 
     def post(self, path, body, method='POST'):
         self.posts.append((method, path, body))
@@ -487,12 +501,19 @@ class SweepCase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
         self.trees = {}
         self.sleeps = []
+        self.real_sleeps = []
         # Every wait in these tests goes through the injected sleep. One that
-        # reaches the real clock fails at once instead of stalling the suite.
-        real = mock.patch.object(lp.time, 'sleep',
-                                 side_effect=AssertionError('a test reached the real sleep'))
+        # reaches the real clock fails at once instead of stalling the suite. It
+        # is recorded as well as raised, because the sweep turns an exception
+        # inside one repository into a row.
+        real = mock.patch.object(lp.time, 'sleep', side_effect=self._real_sleep)
         real.start()
         self.addCleanup(real.stop)
+        self.addCleanup(lambda: self.assertEqual(self.real_sleeps, [], 'the real sleep was reached'))
+
+    def _real_sleep(self, seconds):
+        self.real_sleeps.append(seconds)
+        raise AssertionError('a test reached the real sleep')
 
     def tree(self, name, files):
         root = Path(self.base, 'src', name)
@@ -506,12 +527,17 @@ class SweepCase(unittest.TestCase):
         """`during_wait` runs inside each sleep: what changes on GitHub while the sweep waits."""
         def sleep(seconds):
             self.sleeps.append(seconds)
+            # The budget is 16 steps. A wait that outlives it by this much never ends.
+            if len(self.sleeps) > 60:
+                raise AssertionError('the wait never ends')
             if during_wait:
                 during_wait()
         out = io.StringIO()
         work = tempfile.mkdtemp(prefix='work-', dir=self.base)
         code = lp.sweep(gh, policy(repos, merge=merge), apply=apply, out=out, workdir=work,
                         now=NOW, sleep=sleep)
+        self.assertEqual(gh.unexpected, [])
+        self.assertLessEqual(len(self.sleeps), 60, 'the wait never ends')
         return code, out.getvalue()
 
 
@@ -653,10 +679,34 @@ class MergeHelperTests(unittest.TestCase):
 
     def test_wait_budget_is_sixteen_steps_of_fifteen_seconds(self):
         slept = []
-        budget = lp.WaitBudget(slept.append)
-        spent = [budget.spend() for _ in range(18)]
+        with mock.patch.object(lp.time, 'sleep',
+                               side_effect=AssertionError('the real sleep was reached')):
+            budget = lp.WaitBudget(slept.append)
+            spent = [budget.spend() for _ in range(18)]
         self.assertEqual(spent, [True] * 16 + [False] * 2)
         self.assertEqual(slept, [15] * 16)
+
+    def test_wait_budget_sleeps_for_real_when_no_sleep_is_given(self):
+        with mock.patch.object(lp.time, 'sleep') as real:
+            self.assertTrue(lp.WaitBudget().spend())
+        real.assert_called_once_with(15)
+
+    def test_a_list_is_asked_for_a_hundred_entries_a_page(self):
+        # GitHub's default page is 30. Without this the 100-entry check below
+        # could never fire, and entry 31 would go unread.
+        class Paths:
+            def __init__(self):
+                self.seen = []
+
+            def get(self, path):
+                self.seen.append(path)
+                return []
+
+        gh = Paths()
+        lp._read_list(gh, 'repos/o/r/pulls/1/files')
+        lp._read_list(gh, 'repos/o/r/license?ref=b')
+        self.assertEqual(gh.seen, ['repos/o/r/pulls/1/files?per_page=100',
+                                   'repos/o/r/license?ref=b&per_page=100'])
 
     def test_a_list_that_may_be_cut_short_is_an_error(self):
         # An entry that was not read must never count as a pass.
@@ -682,7 +732,8 @@ class MergeHelperTests(unittest.TestCase):
 class MergeTests(SweepCase):
     PUT_BODY = {'merge_method': 'squash', 'sha': HEAD_SHA}
 
-    def case(self, first=False, existing=True, extra=None, age_hours=1, age_minutes=0):
+    def case(self, first=False, existing=True, extra=None, age_hours=1, age_minutes=0,
+             quiet_minutes=None, default_branch='main'):
         """One repository with a pull request for the sweep's own change."""
         if first:
             name, files = 'bare', {'README.md': 'x\n'}
@@ -693,8 +744,17 @@ class MergeTests(SweepCase):
         self.tree(name, dict(files, **(extra or {})))
         branch = lp.BRANCH_PREFIX + lp.digest_of(writes)
         pulls = {(name, branch): [[12, 'open', None]]} if existing else {}
-        gh = FakeGh([repo(name, license=None if first else 'MIT')], self.trees, pulls=pulls)
-        return gh, gh.arm(name, branch, writes, age_hours=age_hours, age_minutes=age_minutes), name
+        gh = FakeGh([repo(name, license=None if first else 'MIT', default_branch=default_branch)],
+                    self.trees, pulls=pulls)
+        return gh, gh.arm(name, branch, writes, age_hours=age_hours, age_minutes=age_minutes,
+                          quiet_minutes=quiet_minutes, default_branch=default_branch), name
+
+    def direct(self, gh, sc, license_wanted='MIT', **kwargs):
+        """try_merge on its own, for what a whole sweep cannot reach or would hide."""
+        plan = types.SimpleNamespace(writes={'LICENSE': mit(OURS)}, first_license=False)
+        return lp.try_merge(gh, policy({'drift': {'license': license_wanted}}, merge=True),
+                            'example-org', repo('drift'), plan, sc.pull['head']['ref'], 12, [],
+                            lp.WaitBudget(self.sleeps.append), **kwargs)
 
     def run_merge(self, gh, during_wait=None):
         code, text = self.sweep(gh, apply=True, merge=True, during_wait=during_wait)
@@ -768,13 +828,49 @@ class MergeTests(SweepCase):
                 code, text, status = self.run_merge(gh)
                 self.assertNoMerge(gh)
                 self.assertEqual((code, status, self.sleeps), (0, 'pr-open', []))
-                self.assertIn('#12 waits: opened less than 10 minutes ago: a later run merges it '
-                              '(1 file(s))', text)
+                self.assertIn('#12 waits: opened or changed less than 10 minutes ago: a later run '
+                              'merges it (1 file(s))', text)
 
     def test_pull_request_exactly_ten_minutes_old_merges(self):
         gh, _sc, _name = self.case(age_hours=0, age_minutes=10)
         code, _text, status = self.run_merge(gh)
         self.assertEqual((code, status), (0, 'merged'))
+
+    def test_an_old_pull_request_whose_branch_just_moved_waits(self):
+        # "Update branch" on an old pull request: the planned file is unchanged,
+        # so every other guard passes, and the new commit has no checks yet.
+        for first in (False, True):
+            for minutes in (0, 9):
+                with self.subTest(first=first, minutes=minutes):
+                    gh, sc, _name = self.case(first=first, age_hours=30, quiet_minutes=minutes)
+                    sc.check_runs = [[]]
+                    code, text, status = self.run_merge(gh)
+                    self.assertNoMerge(gh)
+                    self.assertEqual((code, status, self.sleeps), (0, 'pr-open', []))
+                    self.assertIn('#12 waits: opened or changed less than 10 minutes ago', text)
+
+    def test_an_old_pull_request_that_last_changed_ten_minutes_ago_merges(self):
+        gh, _sc, _name = self.case(age_hours=30, quiet_minutes=10)
+        _code, _text, status = self.run_merge(gh)
+        self.assertEqual(status, 'merged')
+
+    def test_a_pull_request_that_keeps_changing_for_three_days_turns_red(self):
+        gh, _sc, _name = self.case(age_hours=73, quiet_minutes=1)
+        code, text, status = self.run_merge(gh)
+        self.assertNoMerge(gh)
+        self.assertEqual((code, status), (1, 'pr-open'))
+        self.assertIn('#12 waits: opened or changed less than 10 minutes ago', text)
+
+    def test_the_real_clock_is_used_when_none_is_given(self):
+        def stamp(hours):
+            when = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
+            return when.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        gh, sc, _name = self.case()
+        sc.pull['created_at'] = sc.pull['updated_at'] = stamp(0)
+        self.assertEqual(self.direct(gh, sc).status, 'waiting')
+        sc.pull['created_at'] = sc.pull['updated_at'] = stamp(1)
+        self.assertEqual(self.direct(gh, sc).status, 'merged')
 
     def test_open_decision_refuses(self):
         gh, _sc, _name = self.case(extra={'package.json': '{"license": "ISC"}'})
@@ -1117,7 +1213,10 @@ class MergeTests(SweepCase):
     def test_queued_is_only_reported_when_github_names_the_queue_entry(self):
         for reply in ({}, {'data': {'enqueuePullRequest': None}},
                       {'data': {'enqueuePullRequest': {'mergeQueueEntry': None}}},
-                      {'data': {'enqueuePullRequest': {'mergeQueueEntry': {'id': ''}}}}):
+                      {'data': {'enqueuePullRequest': {'mergeQueueEntry': {'id': ''}}}},
+                      {'data': {'enqueuePullRequest': {'mergeQueueEntry': {'id': 7}}}},
+                      {'data': {'enqueuePullRequest': {'mergeQueueEntry': 'Q1'}}},
+                      {'data': ['Q1']}, {'errors': 'odd'}, {'errors': [None]}):
             with self.subTest(reply=reply):
                 gh, sc, _name = self.case()
                 sc.rules = [{'type': 'merge_queue'}]
@@ -1125,18 +1224,33 @@ class MergeTests(SweepCase):
                 code, text, status = self.run_merge(gh)
                 self.assertEqual((code, status), (1, 'pr-open'))
                 self.assertIn('#12 not merged: merge refused: GitHub did not confirm a merge '
-                              'queue entry (1 file(s))', text)
+                              'queue entry; the pull request may be in the queue (1 file(s))', text)
 
     def test_an_unreadable_answer_to_the_merge_call_says_it_may_have_merged(self):
+        unread = ('#12 not merged: merge refused: GitHub\'s answer to the merge call could not be '
+                  'read; the pull request may have merged')
         for queue in (False, True):
-            with self.subTest(queue=queue):
-                gh, sc, _name = self.case()
-                sc.rules = [{'type': 'merge_queue'}] if queue else []
-                sc.merge_reply = sc.graphql_reply = ValueError('Expecting value: line 1 column 1')
-                code, text, status = self.run_merge(gh)
-                self.assertEqual((code, status, len(gh.merge_calls())), (1, 'pr-open', 1))
-                self.assertIn('#12 not merged: merge refused: GitHub\'s answer to the merge call '
-                              'could not be read; the pull request may have merged', text)
+            for reply in (ValueError('Expecting value: line 1 column 1'), [], None, 'merged', 1):
+                with self.subTest(queue=queue, reply=reply):
+                    gh, sc, _name = self.case()
+                    sc.rules = [{'type': 'merge_queue'}] if queue else []
+                    sc.merge_reply = sc.graphql_reply = reply
+                    code, text, status = self.run_merge(gh)
+                    self.assertEqual((code, status, len(gh.merge_calls())), (1, 'pr-open', 1))
+                    self.assertIn(unread, text)
+
+    def test_a_merge_call_that_fails_in_an_unforeseen_way_says_it_may_have_merged(self):
+        for queue in (False, True):
+            for error in (OSError('boom'), IndexError('boom'), KeyError('boom')):
+                with self.subTest(queue=queue, error=error):
+                    gh, sc, _name = self.case()
+                    sc.rules = [{'type': 'merge_queue'}] if queue else []
+                    sc.merge_reply = sc.graphql_reply = error
+                    code, text, status = self.run_merge(gh)
+                    self.assertEqual((code, status, len(gh.merge_calls())), (1, 'pr-open', 1))
+                    self.assertIn('#12 not merged: merge refused: the merge call failed '
+                                  'unexpectedly (%r); the pull request may have merged' % (error,),
+                                  text)
 
     def test_merge_call_that_raises_is_refused_with_the_reason(self):
         gh, _sc, _name = self.case()
@@ -1148,12 +1262,95 @@ class MergeTests(SweepCase):
         self.assertNotIn('second line', text)
 
     def test_merge_response_that_is_not_merged_true_is_refused(self):
-        for reply in ({'merged': False, 'message': 'Head branch was modified'}, {}, {'merged': 'true'}):
-            gh, sc, _name = self.case()
-            sc.merge_reply = reply
-            code, text, status = self.run_merge(gh)
-            self.assertEqual((code, status), (1, 'pr-open'), reply)
-            self.assertIn('#12 not merged: merge refused: ', text)
+        unconfirmed = ('GitHub answered the merge call without confirming it; the pull request '
+                       'may have merged')
+        for reply, why in (({'merged': False, 'message': 'Head branch was modified'},
+                            'Head branch was modified'),
+                           ({'merged': False}, 'GitHub did not merge it'),
+                           ({'merged': False, 'message': 7}, 'GitHub did not merge it'),
+                           ({}, unconfirmed), ({'merged': 'true'}, unconfirmed),
+                           ({'merged': 1}, unconfirmed), ({'merged': None}, unconfirmed)):
+            with self.subTest(reply=reply):
+                gh, sc, _name = self.case()
+                sc.merge_reply = reply
+                code, text, status = self.run_merge(gh)
+                self.assertEqual((code, status), (1, 'pr-open'))
+                self.assertIn('#12 not merged: merge refused: %s (1 file(s))' % why, text)
+
+    def test_an_error_of_an_unforeseen_kind_before_the_merge_call_is_refused(self):
+        gh, sc, _name = self.case()
+        sc.reviews = [{'state': 'APPROVED', 'user': None}]
+        self.assertEqual(self.direct(gh, sc, now=NOW).reason,
+                         'merge refused: unexpected answer from GitHub (TypeError('
+                         '"\'NoneType\' object is not subscriptable"))')
+        with mock.patch.object(lp, '_merge_decision', side_effect=OSError('boom')):
+            outcome = self.direct(gh, sc, now=NOW)
+        self.assertEqual((outcome.status, outcome.reason),
+                         ('refused', "merge refused: unexpected error (OSError('boom'))"))
+        self.assertNoMerge(gh)
+
+    def test_every_list_read_asks_for_a_hundred_entries(self):
+        gh, sc, _name = self.case()
+        self.assertEqual(self.run_merge(gh)[2], 'merged')
+        api, branch = 'repos/example-org/drift/', sc.pull['head']['ref']
+        self.assertEqual(gh.gets, [
+            api + 'pulls/12',
+            api + 'pulls/12/files?per_page=100',
+            api + 'license?ref=' + branch,
+            api + 'rules/branches/main?per_page=100',
+            api + 'commits/%s/check-runs?per_page=100' % HEAD_SHA,
+            api + 'commits/%s/status?per_page=100' % HEAD_SHA,
+            api + 'pulls/12/reviews?per_page=100'])
+
+    def test_rules_are_read_for_the_default_branch_whatever_it_is_called(self):
+        gh, sc, _name = self.case(default_branch='trunk')
+        sc.rules = [required('test')]
+        sc.check_runs = [[]]
+        _code, text, status = self.run_merge(gh)
+        self.assertNoMerge(gh)
+        self.assertEqual(status, 'pr-open')
+        self.assertIn('#12 waits: the required check test has not reported', text)
+        self.assertIn('repos/example-org/drift/rules/branches/trunk?per_page=100', gh.gets)
+
+    def test_a_rule_list_too_long_to_read_in_one_page_refuses(self):
+        gh, sc, _name = self.case()
+        sc.rules = [{'type': 'pull_request'}] * 100
+        _code, text, _status = self.run_merge(gh)
+        self.assertNoMerge(gh)
+        self.assertIn('#12 not merged: merge refused: more than 100 entries at ', text)
+
+    def test_the_license_wanted_on_the_branch_is_the_repository_s_own(self):
+        for wanted, seen, merges in (('Apache-2.0', 'Apache-2.0', True), ('Apache-2.0', 'MIT', False),
+                                     ('MIT', 'Apache-2.0', False)):
+            with self.subTest(wanted=wanted, seen=seen):
+                gh, sc, _name = self.case()
+                gh.detected_on_branch = seen
+                outcome = self.direct(gh, sc, license_wanted=wanted, now=NOW)
+                if merges:
+                    self.assertEqual(outcome.status, 'merged')
+                else:
+                    self.assertEqual((outcome.status, outcome.reason, gh.merge_calls()),
+                                     ('refused', 'GitHub does not detect %s on the branch' % wanted, []))
+
+    def test_one_repository_s_surprise_does_not_hide_the_rows_of_the_others(self):
+        gh, _sc, _name = self.case()
+        self.tree('later', {'LICENSE': mit(OURS)})
+        gh.repos.append(repo('later'))
+        gh.trees = self.trees
+        real_clone = gh.clone
+
+        def clone(org, name, dest):
+            if name == 'later':
+                raise OSError('disk full')
+            real_clone(org, name, dest)
+
+        gh.clone = clone
+        code, text = self.sweep(gh, apply=True, merge=True)
+        self.assertIn('#12 merged (1 file(s))', text)
+        self.assertIn('error          OSError: disk full', text)
+        self.assertIn('2 public repositories examined, 0 private not examined, 1 need attention.',
+                      text)
+        self.assertEqual(code, 2)
 
     def test_a_read_that_fails_is_refused_and_never_merged(self):
         for tail in ('/pulls/12', '/pulls/12/files', '/pulls/12/reviews', '/check-runs',

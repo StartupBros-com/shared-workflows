@@ -10,9 +10,9 @@
 org and, with --apply, opens one pull request per repository that differs. When
 policy.toml also sets `merge = true` under [sweep], --apply merges the pull
 requests it opened, once a list of guards all hold (see try_merge). No pull
-request merges in the run that opened it, and a first LICENSE only merges once
-it has been open for 20 hours. Without --apply, or without that switch, the
-sweep never merges anything.
+request merges in the run that opened it or within 10 minutes of its last
+change, and a first LICENSE only merges once it has been open for 20 hours.
+Without --apply, or without that switch, the sweep never merges anything.
 
 Rules the planner never breaks:
   * a copyright line naming someone other than the policy holder is left alone;
@@ -61,7 +61,7 @@ COPYRIGHT_RE = re.compile(
 BRANCH_PREFIX = 'chore/license-policy-'
 SKIP_DIRS = ('.git', 'node_modules')
 FIRST_LICENSE_HOLD_HOURS = 20       # a first LICENSE never merges younger than this
-SETTLE_MINUTES = 10                 # nothing merges younger than this: checks may not have started
+SETTLE_MINUTES = 10                 # nothing merges this soon after its last change
 STALE_HOURS = 72                    # a pull request still waiting after this is red
 WAIT_TOTAL_SECONDS = 240            # one budget for checks, shared by the whole sweep
 WAIT_STEP_SECONDS = 15
@@ -673,24 +673,40 @@ def _pull_refusal(pull, org, repo, branch):
     return ''
 
 
+def _dig(value, *keys):
+    """value[k1][k2]... through dicts only; None as soon as a step is not a dict."""
+    for key in keys:
+        value = value.get(key) if isinstance(value, dict) else None
+    return value
+
+
 def _merge_decision(gh, policy, org, repo, plan, branch, number, decisions, budget, now,
                     opened_now):
     name = repo['name']
     api = 'repos/%s/%s' % (org, name)
     first_wait = ('first license: merges once the pull request is %d hours old'
                   % FIRST_LICENSE_HOLD_HOURS)
+    unread = 'GitHub\'s answer to the merge call could not be read; the pull request may have merged'
 
     def refuse(why):
         return MergeOutcome('refused', why)
 
     def send(path, body, method='POST'):
+        """The merge or enqueue call. A RuntimeError is gh's own report that GitHub
+        refused or the call failed. Anything else leaves the outcome unknown, so
+        the refusal says the pull request may have merged."""
         try:
-            return gh.post(path, body, method=method)
+            reply = gh.post(path, body, method=method)
+        except RuntimeError:
+            raise
         except ValueError:
-            # The call went out and only its answer was unreadable, so say so
-            # instead of reporting a plain refusal.
-            raise RuntimeError('GitHub\'s answer to the merge call could not be read; '
-                               'the pull request may have merged') from None
+            raise RuntimeError(unread) from None
+        except Exception as exc:
+            raise RuntimeError('the merge call failed unexpectedly (%r); the pull request '
+                               'may have merged' % (exc,)) from None
+        if not isinstance(reply, dict):
+            raise RuntimeError(unread)
+        return reply
 
     if decisions:
         return refuse('a decision is open')
@@ -709,9 +725,12 @@ def _merge_decision(gh, policy, org, repo, plan, branch, number, decisions, budg
     stale = age > datetime.timedelta(hours=STALE_HOURS)
     if plan.first_license and age < datetime.timedelta(hours=FIRST_LICENSE_HOLD_HOURS):
         return MergeOutcome('waiting', first_wait, stale)
-    if age < datetime.timedelta(minutes=SETTLE_MINUTES):
-        return MergeOutcome('waiting', 'opened less than %d minutes ago: a later run merges it'
-                            % SETTLE_MINUTES)
+    # Measured from the last change, not from when it was opened: a new commit
+    # on an old pull request ("Update branch") has no checks yet either, and
+    # GitHub moves updated_at when the branch moves.
+    if now - _parse_time(pull['updated_at']) < datetime.timedelta(minutes=SETTLE_MINUTES):
+        return MergeOutcome('waiting', 'opened or changed less than %d minutes ago: a later '
+                            'run merges it' % SETTLE_MINUTES, stale)
     sha = pull['head']['sha']
     files = _read_list(gh, '%s/pulls/%d/files' % (api, number))
     if (sorted(f['filename'] for f in files) != sorted(plan.writes)
@@ -726,7 +745,7 @@ def _merge_decision(gh, policy, org, repo, plan, branch, number, decisions, budg
             seen = None
         if seen != want:
             return refuse('GitHub does not detect %s on the branch' % want)
-    rules = gh.get('%s/rules/branches/%s' % (api, repo['default_branch']))
+    rules = _read_list(gh, '%s/rules/branches/%s' % (api, repo['default_branch']))
     required = [check['context'] for rule in rules if rule.get('type') == 'required_status_checks'
                 for check in rule['parameters']['required_status_checks']]
     waited = False
@@ -755,17 +774,23 @@ def _merge_decision(gh, policy, org, repo, plan, branch, number, decisions, budg
             'query': 'mutation($id: ID!, $oid: GitObjectID!) { enqueuePullRequest(input: '
                      '{pullRequestId: $id, expectedHeadOid: $oid}) { mergeQueueEntry { id } } }',
             'variables': {'id': pull['node_id'], 'oid': sha}})
-        entry = ((reply.get('data') or {}).get('enqueuePullRequest') or {}).get('mergeQueueEntry')
-        if not (entry or {}).get('id'):
-            first = (reply.get('errors') or [{}])[0]
-            said = first.get('message') if isinstance(first, dict) else first
-            return _refused(said or 'GitHub did not confirm a merge queue entry')
-        return MergeOutcome('queued')
+        entry = _dig(reply, 'data', 'enqueuePullRequest', 'mergeQueueEntry', 'id')
+        if isinstance(entry, str) and entry:
+            return MergeOutcome('queued')
+        errors = reply.get('errors')
+        said = _dig(errors[0], 'message') if isinstance(errors, list) and errors else None
+        return _refused(said if isinstance(said, str) and said else
+                        'GitHub did not confirm a merge queue entry; the pull request may be '
+                        'in the queue')
     reply = send('%s/pulls/%d/merge' % (api, number),
                  {'merge_method': 'squash', 'sha': sha}, method='PUT')
-    if reply.get('merged') is not True:
-        return _refused(reply.get('message') or 'GitHub did not merge it')
-    return MergeOutcome('merged')
+    if reply.get('merged') is True:
+        return MergeOutcome('merged')
+    if reply.get('merged') is False:
+        said = reply.get('message')
+        return _refused(said if isinstance(said, str) and said else 'GitHub did not merge it')
+    return _refused('GitHub answered the merge call without confirming it; the pull request '
+                    'may have merged')
 
 
 def try_merge(gh, policy, org, repo, plan, branch, number, decisions, budget, now=None,
@@ -782,8 +807,10 @@ def try_merge(gh, policy, org, repo, plan, branch, number, decisions, budget, no
                                now, opened_now)
     except RuntimeError as exc:
         return _refused(exc)
-    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as exc:
         return _refused('unexpected answer from GitHub (%r)' % (exc,))
+    except Exception as exc:    # nothing may escape: the rows already made must still print
+        return _refused('unexpected error (%r)' % (exc,))
 
 
 def merge_row(name, open_status, number, outcome, summary, first_license, decisions):
@@ -886,6 +913,11 @@ def sweep(gh, policy, apply=False, only=(), out=sys.stdout, workdir=None, now=No
                                        budget, now))
             except (RuntimeError, subprocess.CalledProcessError) as exc:
                 rows.append(Row(repo['name'], 'error', str(exc), red=True))
+            except Exception as exc:
+                # One repository's surprise must not hide what the run already
+                # did to the others, which may include a merge.
+                rows.append(Row(repo['name'], 'error', '%s: %s' % (type(exc).__name__, exc),
+                                red=True))
     finally:
         if own_dir:
             shutil.rmtree(workdir, ignore_errors=True)
