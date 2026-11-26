@@ -220,7 +220,7 @@ the sweep manages did on 2026-11-26.
   is a grant that cannot be taken back.
 - Reopen a pull request someone closed. It reports the closed one instead.
 - Make the same change more than once every `refix_after_days` days. See
-  "A license changed again after the sweep fixed it" below.
+  "A license changed again after the sweep fixed it" above.
 - Edit a package manifest. A `package.json` or `pyproject.toml` whose license
   field disagrees with the LICENSE is reported.
 - Name a private repository. Private ones are counted and nothing more.

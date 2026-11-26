@@ -429,6 +429,7 @@ class FakeGh:
         self.detected_on_branch = detected_on_branch
         self.detected_by_id = detected_by_id
         self.refs = {}          # (repository, branch) -> the commit that branch stands at
+        self.heads = {}         # pull request number -> its last commit, where a test sets one
         self.posts = []
         self.gets = []
         self.cloned = []
@@ -462,6 +463,7 @@ class FakeGh:
         if '/contributors' in path:
             return self.contributors.get(name, [['User', 'owner']])
         if '/git/matching-refs/' in path:
+            self._maybe_fail(path)
             # As GitHub answers it: every ref whose name starts with what was asked for.
             prefix = path.split('/git/matching-refs/heads/')[1]
             found = sorted((branch, tip) for (owner, branch), tip in self.refs.items()
@@ -501,6 +503,10 @@ class FakeGh:
         if base.endswith('/rules/branches/' + scenario.default_branch):
             return scenario.rules
         if '/pulls/' in base:
+            tail = base.rsplit('/', 1)[1]
+            head = self.heads.get(int(tail)) if tail.isdigit() else None
+            if head:
+                return dict(scenario.pull, head=dict(scenario.pull['head'], sha=head))
             return scenario.pull
         self._unexpected(path)
 
@@ -761,8 +767,8 @@ WEEK = 7 * 24      # hours
 class RefixTests(SweepCase):
     """A file that differs again after the sweep's pull request for it merged."""
 
-    def drifted(self, pulls):
-        self.tree('drift', {'LICENSE': mit('Copyright (c) 2026 Example Holdings')})
+    def drifted(self, pulls, **other_files):
+        self.tree('drift', {'LICENSE': mit('Copyright (c) 2026 Example Holdings'), **other_files})
         self.writes = {'LICENSE': mit(OURS)}
         self.branch = lp.BRANCH_PREFIX + lp.digest_of(self.writes)
         return FakeGh([repo('drift')], self.trees, pulls={('drift', self.branch): pulls})
@@ -892,6 +898,46 @@ class RefixTests(SweepCase):
                 self.assertIn('#3 merged and the tree differs again, but its branch %s is still '
                               'there' % self.branch, text)
                 self.assertEqual(gh.refs, {('drift', self.branch): HEAD_SHA})
+                self.assertEqual(code, 2)
+
+    def test_the_branch_is_compared_with_the_newest_merged_pull_request(self):
+        older, newer = [3, 'closed', ago(hours=30 * 24)], [9, 'closed', ago(hours=WEEK + 1)]
+        for pulls in ([older, newer], [newer, older]):
+            with self.subTest(order=[row[0] for row in pulls]):
+                gh = self.drifted(pulls)
+                gh.arm('drift', self.branch, self.writes)
+                gh.heads = {3: 'e' * 40, 9: 'd' * 40}
+                gh.refs[('drift', self.branch)] = 'd' * 40
+                code, text = self.sweep(gh, apply=True, merge=True, refix=7)
+                self.assertEqual(gh.posts, [])
+                self.assertIn('#9 merged and the tree differs again, but its branch', text)
+                self.assertEqual(code, 2)
+
+    def test_a_branch_list_that_cannot_be_read_stops_the_change(self):
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                gh = self.drifted([[3, 'closed', ago(hours=WEEK + 1)]])
+                gh.arm('drift', self.branch, self.writes)
+                gh.fail = {'/heads/' + self.branch}
+                code, text = self.sweep(gh, apply=apply, merge=True, refix=7)
+                self.assertEqual(gh.posts, [])
+                self.assertIn('error', text)
+                self.assertNotIn('would-open-pr', text)
+                self.assertNotIn('pr-opened', text)
+                self.assertEqual(code, 2)
+
+    def test_a_decision_the_plan_already_carries_is_reported_next_to_this_one(self):
+        manifest = '{"name": "drift", "license": "Apache-2.0"}\n'
+        for pulls, expected in (
+                ([[3, 'closed', ago(hours=24)]], '#3 merged but the tree still differs'),
+                ([[3, 'closed', None]], '#3 was closed without merging')):
+            with self.subTest(expected=expected):
+                gh = self.drifted(pulls, **{'package.json': manifest})
+                code, text = self.sweep(gh, apply=True, refix=7)
+                self.assertEqual(gh.posts, [])
+                self.assertIn(expected, text)
+                self.assertIn("package.json: declares 'Apache-2.0' but the policy license is MIT",
+                              text)
                 self.assertEqual(code, 2)
 
     def test_a_left_over_branch_is_not_looked_for_until_the_change_is_due(self):
