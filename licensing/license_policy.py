@@ -7,7 +7,12 @@
 
 `check` and `render` share one planner, so what `check` reports is exactly what
 `render` writes. `sweep` runs the planner over every public repository in the
-org and, with --apply, opens one pull request per repository that differs.
+org and, with --apply, opens one pull request per repository that differs. When
+policy.toml also sets `merge = true` under [sweep], --apply merges the pull
+requests it opened, once a list of guards all hold (see try_merge). No pull
+request merges in the run that opened it or within 10 minutes of its last
+change, and a first LICENSE only merges once it has been open for 20 hours.
+Without --apply, or without that switch, the sweep never merges anything.
 
 Rules the planner never breaks:
   * a copyright line naming someone other than the policy holder is left alone;
@@ -15,8 +20,9 @@ Rules the planner never breaks:
   * a directory that already holds any license-like file gains no new one;
   * a first LICENSE is only written when the sweep has checked commit authors.
 
-Exit codes: 0 conforms, 1 differs but fixable (or a pull request is waiting),
-2 needs a decision recorded in policy.toml.
+Exit codes: 0 conforms (a pull request the sweep will merge on a later run
+counts as conforming), 1 differs but fixable, or a pull request was refused or
+has waited three days, 2 needs a decision recorded in policy.toml.
 """
 from __future__ import annotations
 
@@ -32,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 try:
     import tomllib
@@ -53,6 +60,11 @@ COPYRIGHT_RE = re.compile(
     re.IGNORECASE)
 BRANCH_PREFIX = 'chore/license-policy-'
 SKIP_DIRS = ('.git', 'node_modules')
+FIRST_LICENSE_HOLD_HOURS = 20       # a first LICENSE never merges younger than this
+SETTLE_MINUTES = 10                 # nothing merges this soon after its last change
+STALE_HOURS = 72                    # a pull request still waiting after this is red
+WAIT_TOTAL_SECONDS = 240            # one budget for checks, shared by the whole sweep
+WAIT_STEP_SECONDS = 15
 
 
 class PolicyError(ValueError):
@@ -77,6 +89,7 @@ class Policy:
     owner_logins: frozenset
     org: str
     repos: dict
+    merge: bool = False
 
     @property
     def holder_text(self):
@@ -124,7 +137,10 @@ def load_policy(path=DEFAULT_POLICY):
     provenance = raw.get('provenance', {})
     _only(provenance, ('owner_logins',), '[provenance]')
     sweep = raw.get('sweep', {})
-    _only(sweep, ('org',), '[sweep]')
+    _only(sweep, ('org', 'merge'), '[sweep]')
+    merge = sweep.get('merge', False)
+    if not isinstance(merge, bool):
+        raise PolicyError('[sweep] merge must be true or false')
     repos = raw.get('repos', {})
     for name, entry in repos.items():
         where = '[repos.%s]' % name
@@ -139,7 +155,7 @@ def load_policy(path=DEFAULT_POLICY):
         name=holder['name'], brand=holder.get('brand', ''), url=holder.get('url', ''),
         aliases=tuple(holder.get('aliases', ())), license=license_id,
         owner_logins=frozenset(provenance.get('owner_logins', ())),
-        org=sweep.get('org', ''), repos=repos)
+        org=sweep.get('org', ''), repos=repos, merge=merge)
 
 
 def _norm(text):
@@ -472,11 +488,18 @@ def pr_body(policy, plan, detected):
         # branch's license while the default branch has none.
         lines[-1] += (' GitHub does not report a branch\'s license while the default branch has '
                       'none, so the next sweep after the merge confirms detection.')
+        hold_sentence = ('Merge only if this code is meant to be open source.'
+                         if not policy.merge else
+                         'The sweep merges this pull request on a later run, once it has been '
+                         'open for %d hours. Close it to stop that.' % FIRST_LICENSE_HOLD_HOURS)
         lines += ['', 'Every commit author here is an owner login or a bot, and the tree has no '
                       '`UPSTREAM.md`.',
                   '', '**This repository had no license.** Merging grants the %s license to '
-                      'everyone, and that grant cannot be withdrawn for copies already taken. '
-                      'Merge only if this code is meant to be open source.' % policy.license]
+                      'everyone, and that grant cannot be withdrawn for copies already taken. %s'
+                  % (policy.license, hold_sentence)]
+    if policy.merge and not plan.first_license:
+        lines += ['', 'The sweep merges this pull request itself on a later run, once its checks '
+                      'have passed. Close it, or mark it as a draft, to stop that.']
     lines += ['', 'To change what the sweep does here, edit `licensing/policy.toml` in '
                   'shared-workflows.']
     return '\n'.join(lines) + '\n'
@@ -545,10 +568,294 @@ def open_pull_request(gh, policy, org, repo, tree, plan, branch):
     return pull['number'], detected
 
 
-def sweep_repo(gh, policy, org, repo, workdir, apply, template):
+class WaitBudget:
+    """Seconds the whole sweep may spend waiting for checks, spent in fixed steps."""
+
+    def __init__(self, sleep=None, total=WAIT_TOTAL_SECONDS, step=WAIT_STEP_SECONDS):
+        self.sleep, self.left, self.step = sleep or time.sleep, total, step
+
+    def spend(self):
+        """Sleep one step and return True, or return False when the budget is gone."""
+        if self.left < self.step:
+            return False
+        self.left -= self.step
+        self.sleep(self.step)
+        return True
+
+
+@dataclasses.dataclass
+class MergeOutcome:
+    status: str         # 'merged', 'queued', 'waiting' or 'refused'
+    reason: str = ''
+    stale: bool = False  # waiting, and the pull request is older than STALE_HOURS
+
+
+def blob_id(text):
+    """The git blob id of a file's text: what GitHub reports as a file's sha."""
+    data = text.encode('utf-8', 'surrogateescape')
+    return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+
+
+def _parse_time(text):
+    return datetime.datetime.strptime(text, '%Y-%m-%dT%H:%M:%SZ').replace(
+        tzinfo=datetime.timezone.utc)
+
+
+def _refused(text):
+    lines = str(text).strip().splitlines()
+    return MergeOutcome('refused', 'merge refused: ' + (lines[0][:200] if lines else 'unknown error'))
+
+
+def _named(exc):
+    """An exception as text, whatever its own repr does."""
+    try:
+        return repr(exc)
+    except Exception:
+        return type(exc).__name__
+
+
+def _github_said_no(error):
+    """Whether the text of a failed gh call shows that GitHub answered and refused.
+
+    gh prints GitHub's own answer as "gh: <message> (HTTP <status>)", or as
+    "gh: <message>" for a GraphQL error. A 5xx, a network failure or anything
+    else does not say whether a write happened.
+    """
+    said = str(error).partition(' failed: ')[2]
+    return said.startswith('gh: ') and not re.search(r'\bHTTP 5\d\d\b', said)
+
+
+def _read_list(gh, path, key=None):
+    """One full page of a list endpoint. A page that may be cut short is an error,
+    because a check or review that was not read must not count as a pass."""
+    data = gh.get(path + ('&' if '?' in path else '?') + 'per_page=100')
+    items = data[key] if key else data
+    if len(items) >= 100 or (key and data.get('total_count', len(items)) > len(items)):
+        raise RuntimeError('more than 100 entries at %s' % path)
+    return items
+
+
+def _check_state(gh, api, sha, required=()):
+    """('ok'|'pending'|'failed', the failed check or what is awaited) for a commit.
+
+    `required` names the checks the default branch requires. GitHub answers the
+    same for a required check that has not reported yet as for a repository
+    with no checks at all, so a required check that is absent counts as
+    pending here, never as nothing to wait for.
+    """
+    runs = _read_list(gh, '%s/commits/%s/check-runs' % (api, sha), 'check_runs')
+    # The combined status endpoint's .statuses array lists each context once; its
+    # top-level .state reads 'pending' for a commit that has no statuses at all.
+    statuses = _read_list(gh, '%s/commits/%s/status' % (api, sha), 'statuses')
+    pending, reported = False, set()
+    for run in runs:
+        reported.add(run['name'])
+        if run['status'] != 'completed':
+            pending = True
+        elif run['conclusion'] not in ('success', 'neutral', 'skipped'):
+            return 'failed', run['name']
+    for status in statuses:
+        reported.add(status['context'])
+        if status['state'] == 'pending':
+            pending = True
+        elif status['state'] != 'success':
+            return 'failed', status['context']
+    if pending:
+        return 'pending', 'checks are still running'
+    absent = sorted(set(required) - reported)
+    if absent:
+        return 'pending', 'the required check %s has not reported' % absent[0]
+    return 'ok', ''
+
+
+def _changes_requested_by(gh, api, number):
+    """A reviewer whose latest decisive review asks for changes, else ''."""
+    latest = {}
+    for review in _read_list(gh, '%s/pulls/%d/reviews' % (api, number)):
+        if review['state'] in ('APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'):
+            latest[review['user']['login']] = review['state']
+    return next((who for who, state in latest.items() if state == 'CHANGES_REQUESTED'), '')
+
+
+def _pull_refusal(pull, org, repo, branch):
+    """Why this is not the sweep's own open pull request against the default branch, else ''."""
+    head = pull['head']
+    if pull['state'] != 'open':
+        return 'it is not open'
+    if pull['draft']:
+        return 'it is a draft'
+    if pull['base']['ref'] != repo['default_branch']:
+        return 'it targets %s, not %s' % (pull['base']['ref'], repo['default_branch'])
+    if (head['ref'] != branch
+            or (head.get('repo') or {}).get('full_name') != '%s/%s' % (org, repo['name'])):
+        return 'its branch is not the sweep\'s own branch'
+    return ''
+
+
+def _dig(value, *keys):
+    """value[k1][k2]... through dicts only; None as soon as a step is not a dict."""
+    for key in keys:
+        value = value.get(key) if isinstance(value, dict) else None
+    return value
+
+
+def _merge_decision(gh, policy, org, repo, plan, branch, number, decisions, budget, now,
+                    opened_now):
+    name = repo['name']
+    api = 'repos/%s/%s' % (org, name)
+    first_wait = ('first license: merges once the pull request is %d hours old'
+                  % FIRST_LICENSE_HOLD_HOURS)
+    merged_doubt = 'the pull request may have merged'
+    queued_doubt = 'the pull request may be in the queue'
+
+    def refuse(why):
+        return MergeOutcome('refused', why)
+
+    def send(path, body, doubt, method='POST'):
+        """The merge or enqueue call. GitHub's own refusal is raised as it stands.
+        Any other failure leaves the outcome unknown, and its reason leads with
+        the doubt, because _refused keeps only the first 200 characters."""
+        try:
+            reply = gh.post(path, body, method=method)
+        except RuntimeError as exc:
+            if _github_said_no(exc):
+                raise
+            raise RuntimeError('%s: %s' % (doubt, exc)) from None
+        except ValueError:
+            raise RuntimeError('%s: GitHub\'s answer could not be read' % doubt) from None
+        except Exception as exc:
+            raise RuntimeError('%s: the call failed unexpectedly (%s)'
+                               % (doubt, _named(exc))) from None
+        if not isinstance(reply, dict):
+            raise RuntimeError('%s: GitHub\'s answer could not be read' % doubt)
+        return reply
+
+    if decisions:
+        return refuse('a decision is open')
+    if opened_now:
+        # Never in the run that opened it. Checks start a moment after a pull
+        # request exists, and until they do GitHub reports none, which reads
+        # the same as all green. A first license is also owed a day in which
+        # someone can close it. This does not depend on any clock.
+        return MergeOutcome('waiting', first_wait if plan.first_license else
+                            'opened in this run: a later run merges it')
+    pull = gh.get('%s/pulls/%d' % (api, number))
+    why = _pull_refusal(pull, org, repo, branch)
+    if why:
+        return refuse(why)
+    opened, changed = _parse_time(pull['created_at']), _parse_time(pull['updated_at'])
+    if changed < opened:
+        return refuse('its last change is dated before it was opened')
+    age = now - opened
+    stale = age > datetime.timedelta(hours=STALE_HOURS)
+    if plan.first_license and age < datetime.timedelta(hours=FIRST_LICENSE_HOLD_HOURS):
+        return MergeOutcome('waiting', first_wait, stale)
+    # Measured from the last change, not from when it was opened: a new commit
+    # on an old pull request ("Update branch") has no checks yet either, and
+    # GitHub moves updated_at when the branch moves.
+    if now - changed < datetime.timedelta(minutes=SETTLE_MINUTES):
+        return MergeOutcome('waiting', 'opened or changed less than %d minutes ago: a later '
+                            'run merges it' % SETTLE_MINUTES, stale)
+    sha = pull['head']['sha']
+    files = _read_list(gh, '%s/pulls/%d/files' % (api, number))
+    if (sorted(f['filename'] for f in files) != sorted(plan.writes)
+            or any(f['status'] not in ('added', 'modified') for f in files)
+            or any(f['sha'] != blob_id(plan.writes[f['filename']]) for f in files)):
+        return refuse('its files no longer match the plan')
+    if not plan.first_license:
+        want = policy.for_repo(name).license
+        try:
+            seen = (gh.get('%s/license?ref=%s' % (api, branch)).get('license') or {}).get('spdx_id')
+        except RuntimeError:
+            seen = None
+        if seen != want:
+            return refuse('GitHub does not detect %s on the branch' % want)
+    rules = _read_list(gh, '%s/rules/branches/%s' % (api, repo['default_branch']))
+    required = [check['context'] for rule in rules if rule.get('type') == 'required_status_checks'
+                for check in rule['parameters']['required_status_checks']]
+    waited = False
+    while True:
+        state, detail = _check_state(gh, api, sha, required)
+        if state == 'failed':
+            return refuse('a check failed: %s' % detail)
+        if state == 'ok':
+            break
+        if not budget.spend():
+            return MergeOutcome('waiting', detail, stale)
+        waited = True
+    if waited:
+        # Minutes may have passed. Look at the pull request again before acting on it.
+        pull = gh.get('%s/pulls/%d' % (api, number))
+        why = _pull_refusal(pull, org, repo, branch) or (
+            '' if pull['head']['sha'] == sha else 'its branch changed while its checks ran')
+        if why:
+            return refuse(why)
+    # Read last, so a review left while the checks ran is seen.
+    who = _changes_requested_by(gh, api, number)
+    if who:
+        return refuse('changes were requested by %s' % who)
+    if any(rule.get('type') == 'merge_queue' for rule in rules):
+        reply = send('graphql', {
+            'query': 'mutation($id: ID!, $oid: GitObjectID!) { enqueuePullRequest(input: '
+                     '{pullRequestId: $id, expectedHeadOid: $oid}) { mergeQueueEntry { id } } }',
+            'variables': {'id': pull['node_id'], 'oid': sha}}, queued_doubt)
+        entry = _dig(reply, 'data', 'enqueuePullRequest', 'mergeQueueEntry', 'id')
+        if isinstance(entry, str) and entry:
+            return MergeOutcome('queued')
+        errors = reply.get('errors')
+        said = _dig(errors[0], 'message') if isinstance(errors, list) and errors else None
+        return _refused(said if isinstance(said, str) and said else
+                        queued_doubt + ': GitHub did not confirm a merge queue entry')
+    reply = send('%s/pulls/%d/merge' % (api, number),
+                 {'merge_method': 'squash', 'sha': sha}, merged_doubt, method='PUT')
+    if reply.get('merged') is True:
+        return MergeOutcome('merged')
+    if reply.get('merged') is False:
+        said = reply.get('message')
+        return _refused(said if isinstance(said, str) and said else 'GitHub did not merge it')
+    return _refused(merged_doubt + ': GitHub answered the merge call without confirming it')
+
+
+def try_merge(gh, policy, org, repo, plan, branch, number, decisions, budget, now=None,
+              opened_now=False):
+    """Merge the sweep's own pull request when every guard holds.
+
+    A wrong merge of a first LICENSE grants MIT to the world and cannot be
+    undone, so the first guard that fails decides, and any read that fails or
+    answers oddly counts as a refusal, never as a pass.
+    """
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    try:
+        return _merge_decision(gh, policy, org, repo, plan, branch, number, decisions, budget,
+                               now, opened_now)
+    except RuntimeError as exc:
+        return _refused(exc)
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as exc:
+        return _refused('unexpected answer from GitHub (%s)' % _named(exc))
+    except Exception as exc:    # nothing may escape: the rows already made must still print
+        return _refused('unexpected error (%s)' % _named(exc))
+
+
+def merge_row(name, open_status, number, outcome, summary, first_license, decisions):
+    if outcome.status == 'merged':
+        return Row(name, 'merged', '#%d merged (%s)%s' % (
+            number, summary, ', first license' if first_license else ''), decisions)
+    if outcome.status == 'queued':
+        return Row(name, 'queued', '#%d added to the merge queue (%s)' % (number, summary),
+                   decisions)
+    if outcome.status == 'waiting':
+        return Row(name, open_status, '#%d waits: %s (%s)' % (number, outcome.reason, summary),
+                   decisions, red=outcome.stale)
+    return Row(name, open_status, '#%d not merged: %s (%s)' % (number, outcome.reason, summary),
+               decisions, red=True)
+
+
+def sweep_repo(gh, policy, org, repo, workdir, apply, template, budget=None, now=None):
     name = repo['name']
     rp = policy.for_repo(name)
     detected = repo.get('license')
+    merging = apply and policy.merge
+    budget = budget or WaitBudget()
     if repo.get('archived'):
         return Row(name, 'skipped', 'archived')
     if repo.get('fork'):
@@ -577,6 +884,11 @@ def sweep_repo(gh, policy, org, repo, workdir, apply, template):
     summary = '%d file(s)' % len(plan.writes)
     for number, state, _merged in pulls:
         if state == 'open':
+            if merging:
+                outcome = try_merge(gh, policy, org, repo, plan, branch, number, decisions,
+                                    budget, now)
+                return merge_row(name, 'pr-open', number, outcome, summary,
+                                 plan.first_license, decisions)
             return Row(name, 'pr-open', '#%d waits for a merge (%s)' % (number, summary),
                        decisions, red=True)
     if pulls:
@@ -591,12 +903,18 @@ def sweep_repo(gh, policy, org, repo, workdir, apply, template):
     if not plan.first_license and seen != rp.license:
         decisions.append(Finding('decide', 'LICENSE', 'GitHub detects %s on %s instead of %s'
                                  % (seen or 'nothing', branch, rp.license)))
+    if merging:
+        outcome = try_merge(gh, policy, org, repo, plan, branch, number, decisions, budget, now,
+                            opened_now=True)
+        return merge_row(name, 'pr-opened', number, outcome, summary, plan.first_license,
+                         decisions)
     return Row(name, 'pr-opened', '#%d (%s)%s' % (
         number, summary, ', first license: merge by hand' if plan.first_license else ''),
         decisions, red=True)
 
 
-def sweep(gh, policy, apply=False, only=(), out=sys.stdout, workdir=None):
+def sweep(gh, policy, apply=False, only=(), out=sys.stdout, workdir=None, now=None,
+          sleep=None):
     org = policy.org
     repos = gh.lines(
         'orgs/%s/repos?per_page=100&type=all' % org,
@@ -609,13 +927,20 @@ def sweep(gh, policy, apply=False, only=(), out=sys.stdout, workdir=None):
     template = mit_template()
     own_dir = workdir is None
     workdir = workdir or tempfile.mkdtemp(prefix='license-sweep-')
+    budget = WaitBudget(sleep)
     rows = []
     try:
         for repo in public:
             try:
-                rows.append(sweep_repo(gh, policy, org, repo, workdir, apply, template))
+                rows.append(sweep_repo(gh, policy, org, repo, workdir, apply, template,
+                                       budget, now))
             except (RuntimeError, subprocess.CalledProcessError) as exc:
                 rows.append(Row(repo['name'], 'error', str(exc), red=True))
+            except Exception as exc:
+                # One repository's surprise must not hide what the run already
+                # did to the others, which may include a merge.
+                rows.append(Row(repo['name'], 'error', '%s: %s' % (type(exc).__name__, exc),
+                                red=True))
     finally:
         if own_dir:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -654,7 +979,8 @@ def main(argv=None):
         cmd.add_argument('tree')
         cmd.add_argument('--repo', help='repository name (default: from the origin remote)')
     cmd = sub.add_parser('sweep')
-    cmd.add_argument('--apply', action='store_true', help='open pull requests')
+    cmd.add_argument('--apply', action='store_true', help='open pull requests, and merge them when policy.toml sets '
+                          '[sweep] merge = true and every guard holds')
     cmd.add_argument('--only', action='append', default=[], metavar='NAME')
     args = parser.parse_args(argv)
     try:

@@ -2,7 +2,7 @@
 #
 # license_policy.py reads this file and nothing else states the policy. Edit it
 # here; the scheduled sweep opens a pull request in each repository that
-# differs. See README.md in this directory.
+# differs and merges it on a later run. See README.md in this directory.
 
 [holder]
 # The copyright line the tool writes is:
@@ -19,6 +19,8 @@ aliases = [
   "StartupBros",
   "StartupBros LLC",
   "StartupBros / House of Vibe",
+  # The placeholder synthetic-panel was published with. Every commit there is ours.
+  "synthetic-panel contributors",
 ]
 
 [defaults]
@@ -31,6 +33,9 @@ owner_logins = ["StartupBros"]
 
 [sweep]
 org = "StartupBros-com"
+# The sweep merges the pull requests it opened, once the guards listed under
+# "Merging" in README.md all hold. Remove this line and it only opens them.
+merge = true
 
 # Per-repository exceptions. Keys:
 #   mode     = "hands-off"   the tool neither checks nor writes; needs a reason
@@ -42,14 +47,6 @@ org = "StartupBros-com"
 [repos.hov-stack]
 subtrees = ["plugins/*"]
 
-[repos.hov-router]
-mode = "hands-off"
-reason = "Derived from tombii/better-ccflare. Its LICENSE names the upstream holders."
-
-[repos.whoop-mcp]
-mode = "hands-off"
-reason = "Derived from izqui/whoop-mcp. Its LICENSE names the upstream contributors."
-
 [repos.whygraph]
 mode = "hands-off"
 license = "Apache-2.0"
@@ -59,15 +56,3 @@ reason = "Contest entry published as Apache-2.0, judged after 2026-12-11. Holder
 mode = "hands-off"
 license = "Apache-2.0"
 reason = "Contest entry published as Apache-2.0. Leave as submitted until judged."
-
-[repos.synthetic-panel]
-mode = "hands-off"
-reason = "Holder line reads 'synthetic-panel contributors'. Awaiting a decision on naming the holder."
-
-[repos.renpho-mcp-server]
-mode = "hands-off"
-reason = "Holder is an individual and the repository has an outside contributor."
-
-[repos.mac-studio-model-evidence]
-mode = "hands-off"
-reason = "Holder is an individual. Code is MIT and prose is CC BY-ND 4.0."

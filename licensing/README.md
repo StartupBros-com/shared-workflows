@@ -66,8 +66,8 @@ Apache-2.0 lost every exact tie and won every run where it had the feature, so
 a repository that is already Apache-2.0 stays that way until the policy says
 otherwise.
 
-The harness, the plans written before each batch and the per-run scores are
-kept with the decision report, outside this repository.
+The harness, the per-run scores and the two plans that were written before
+their batches ran are kept with the decision report, outside this repository.
 
 ## Commands
 
@@ -84,7 +84,7 @@ archived ones, and plans each remaining one from a shallow clone. Without
 `--apply` it only reports. With `--apply` it opens one pull request per
 repository that differs, built through the GitHub API on a branch named after a
 digest of the change, so a second run finds the first run's pull request
-instead of opening another. It never merges.
+instead of opening another. Whether it also merges them is the next section.
 
 Each pull request that changes an existing license says what GitHub detects on
 its branch, and a mismatch is reported as a decision. A first-license pull
@@ -92,8 +92,64 @@ request cannot say that: GitHub answered 404 for the branch's license on every
 repository whose default branch had none (seen on three, 2026-11-25). The sweep
 after the merge checks the default branch instead.
 
-Exit codes: `0` conforms, `1` differs and the tool can fix it (or a pull
-request is waiting for a merge), `2` something needs a decision.
+Exit codes: `0` conforms, or a pull request is waiting for a later run to
+merge it. `1` differs and the tool can fix it (report mode, or merging switched
+off), or a pull request was refused or has waited three days. `2` something
+needs a decision.
+
+## Merging
+
+With `merge = true` under `[sweep]` in `policy.toml`, `sweep --apply` also
+merges the pull requests it opened. Without that line, or without `--apply`,
+it never merges anything.
+
+A pull request is merged only when all of these hold. The first one that fails
+decides, and a read that fails or answers oddly counts as a refusal, never as a
+pass.
+
+1. No decision is open for the repository.
+2. It was not opened in this run, and nothing about it has changed in the last
+   10 minutes. Checks start a moment after a pull request is opened or its
+   branch gets a new commit ("Update branch" counts). Until they do, GitHub
+   lists none, which reads the same as all green.
+3. A first license has been open for at least 20 hours, so there is a day in
+   which someone can close it.
+4. It is open, is not a draft, targets the default branch, and its branch is
+   the sweep's own.
+5. Its changed files are exactly the files the plan writes, with exactly the
+   planned content. Anything pushed to the branch afterwards stops the merge.
+6. GitHub detects the policy license on the branch. A first license is not
+   asked this, for the reason given above.
+7. No check failed, none is still running, and every check the default branch
+   requires has reported. The sweep waits for running checks for up to four
+   minutes per run, shared across all repositories.
+8. No reviewer's latest review requests changes.
+
+The merge is a squash pinned to the commit that was checked. Where the default
+branch has a merge queue, the pull request is added to the queue instead.
+
+In the report, `merged` and `queued` say what was done. `waits: <why>` means
+the next run tries again, and it is not counted as a failure until the pull
+request is three days old. `not merged: <why>` means a guard refused, and the
+run ends non-zero. A reason that starts "the pull request may have merged" or
+"the pull request may be in the queue" means the merge call went out and
+GitHub did not plainly refuse it: the answer was a server error, was missing,
+or made no sense. Look at the pull request.
+
+To stop one merge, close the pull request or mark it as a draft. To stop all
+of them, remove `merge = true`.
+
+What the guards cannot know:
+
+- The author check on a first license reads who committed, not where the code
+  came from. Code copied from elsewhere and committed by an owner login passes
+  it, unless the tree has an `UPSTREAM.md`. A private repository is never
+  touched, so a first license only reaches a repository that someone made
+  public.
+- On a repository whose default branch requires no checks, the 10 minutes in
+  guard 2 is all that tells "has no checks" from "checks have not started".
+  Requiring a check on that branch removes the guess: guard 7 then waits for
+  it by name.
 
 ## What it will not do
 
@@ -129,7 +185,8 @@ subtrees = ["plugins/*"]           # each gets a copy of the root LICENSE if it 
 ```
 
 To treat another spelling as the same holder, add it to `aliases`. To change
-the line everywhere, edit `[holder]`; the next sweep opens the pull requests.
+the line everywhere, edit `[holder]`; the next sweep opens the pull requests
+and the one after it merges them.
 
 ## Tests
 
