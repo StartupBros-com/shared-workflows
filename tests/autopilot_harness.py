@@ -26,6 +26,25 @@ def step(job, step_id):
     return next(item for item in WORKFLOW["jobs"][job]["steps"] if item.get("id") == step_id)
 
 
+_TRIAGE_STEP = ("triage", "triage")
+_AUTOFIX_PRE_STEP = ("autofix", "pre")
+_HANDOFF_STEP = ("handoff", "handoff")
+
+
+def _marked_blocks(pattern, sites, *, label_diagnostics=True):
+    """Return one verbatim marker body per site, in the supplied order."""
+    scripts = [(job, step(job, step_id)["run"]) for job, step_id in sites]
+    matched = ((job, script, pattern.findall(script)) for job, script in scripts)
+    # Freshness historically scanned both scripts before its unlabeled assertions.
+    if not label_diagnostics:
+        matched = tuple(matched)
+    blocks = []
+    for job, script, matches in matched:
+        assert len(matches) == 1, (job, script) if label_diagnostics else script
+        blocks.append(matches[0])
+    return tuple(blocks)
+
+
 # The freshness predicate (trigger_superseded/trigger_lagging derived from
 # t_num/t_attempt/t_concl vs. l_num/l_attempt/l_concl) cannot live in a
 # shared file: this is a reusable workflow, so production logic runs inline
@@ -45,13 +64,10 @@ def freshness_predicate_blocks():
     predicate. Each call site's `run:` script must contain the marker pair
     exactly once; a missing or duplicated marker fails loudly here rather
     than silently comparing the wrong (or no) text."""
-    triage_script = step("triage", "triage")["run"]
-    autofix_script = step("autofix", "pre")["run"]
-    triage_blocks = FRESHNESS_PREDICATE_PATTERN.findall(triage_script)
-    autofix_blocks = FRESHNESS_PREDICATE_PATTERN.findall(autofix_script)
-    assert len(triage_blocks) == 1, triage_script
-    assert len(autofix_blocks) == 1, autofix_script
-    return triage_blocks[0], autofix_blocks[0]
+    return _marked_blocks(
+        FRESHNESS_PREDICATE_PATTERN, (_TRIAGE_STEP, _AUTOFIX_PRE_STEP),
+        label_diagnostics=False,
+    )
 
 
 # `gh pr list --head` matches by branch name only — gh 2.97.0 does not
@@ -75,15 +91,9 @@ def same_repo_filter_blocks():
     same-repository PR filter. Each call site's `run:` script must contain
     the marker pair exactly once; a missing or duplicated marker fails
     loudly here rather than silently comparing the wrong (or no) text."""
-    triage_script = step("triage", "triage")["run"]
-    autofix_script = step("autofix", "pre")["run"]
-    handoff_script = step("handoff", "handoff")["run"]
-    blocks = {}
-    for name, script in (("triage", triage_script), ("autofix", autofix_script), ("handoff", handoff_script)):
-        found = SAME_REPO_FILTER_PATTERN.findall(script)
-        assert len(found) == 1, (name, script)
-        blocks[name] = found[0]
-    return blocks["triage"], blocks["autofix"], blocks["handoff"]
+    return _marked_blocks(
+        SAME_REPO_FILTER_PATTERN, (_TRIAGE_STEP, _AUTOFIX_PRE_STEP, _HANDOFF_STEP),
+    )
 
 
 # Round-12 P0: head-SHA equality (checked just above each copy of this
@@ -109,15 +119,9 @@ def fork_provenance_gate_blocks():
     contain the marker pair exactly once; a missing or duplicated marker
     fails loudly here rather than silently comparing the wrong (or no)
     text."""
-    triage_script = step("triage", "triage")["run"]
-    autofix_script = step("autofix", "pre")["run"]
-    handoff_script = step("handoff", "handoff")["run"]
-    blocks = {}
-    for name, script in (("triage", triage_script), ("autofix", autofix_script), ("handoff", handoff_script)):
-        found = FORK_PROVENANCE_GATE_PATTERN.findall(script)
-        assert len(found) == 1, (name, script)
-        blocks[name] = found[0]
-    return blocks["triage"], blocks["autofix"], blocks["handoff"]
+    return _marked_blocks(
+        FORK_PROVENANCE_GATE_PATTERN, (_TRIAGE_STEP, _AUTOFIX_PRE_STEP, _HANDOFF_STEP),
+    )
 
 
 # Round-14: a red no-change/no-push outcome (no_changes and its siblings,
@@ -141,14 +145,9 @@ def sibling_verification_blocks():
     revalidation loop. Each call site's `run:` script must contain the
     marker pair exactly once; a missing or duplicated marker fails loudly
     here rather than silently comparing the wrong (or no) text."""
-    triage_script = step("triage", "triage")["run"]
-    handoff_script = step("handoff", "handoff")["run"]
-    blocks = {}
-    for name, script in (("triage", triage_script), ("handoff", handoff_script)):
-        found = SIBLING_VERIFICATION_PATTERN.findall(script)
-        assert len(found) == 1, (name, script)
-        blocks[name] = found[0]
-    return blocks["triage"], blocks["handoff"]
+    return _marked_blocks(
+        SIBLING_VERIFICATION_PATTERN, (_TRIAGE_STEP, _HANDOFF_STEP),
+    )
 
 
 # Companion to SIBLING_VERIFICATION_PATTERN: given the verified inventory,
@@ -170,14 +169,9 @@ def sibling_still_owed_blocks():
     computation. Each call site's `run:` script must contain the marker
     pair exactly once; a missing or duplicated marker fails loudly here
     rather than silently comparing the wrong (or no) text."""
-    triage_script = step("triage", "triage")["run"]
-    handoff_script = step("handoff", "handoff")["run"]
-    blocks = {}
-    for name, script in (("triage", triage_script), ("handoff", handoff_script)):
-        found = SIBLING_STILL_OWED_PATTERN.findall(script)
-        assert len(found) == 1, (name, script)
-        blocks[name] = found[0]
-    return blocks["triage"], blocks["handoff"]
+    return _marked_blocks(
+        SIBLING_STILL_OWED_PATTERN, (_TRIAGE_STEP, _HANDOFF_STEP),
+    )
 
 
 # Round-12 P1: `gh pr list --head` defaults to a 30-item cap with no
@@ -201,15 +195,9 @@ def scoped_pr_lookup_blocks():
     owner-qualified PR lookup. Each call site's `run:` script must contain
     the marker pair exactly once; a missing or duplicated marker fails
     loudly here rather than silently comparing the wrong (or no) text."""
-    triage_script = step("triage", "triage")["run"]
-    autofix_script = step("autofix", "pre")["run"]
-    handoff_script = step("handoff", "handoff")["run"]
-    blocks = {}
-    for name, script in (("triage", triage_script), ("autofix", autofix_script), ("handoff", handoff_script)):
-        found = SCOPED_PR_LOOKUP_PATTERN.findall(script)
-        assert len(found) == 1, (name, script)
-        blocks[name] = found[0]
-    return blocks["triage"], blocks["autofix"], blocks["handoff"]
+    return _marked_blocks(
+        SCOPED_PR_LOOKUP_PATTERN, (_TRIAGE_STEP, _AUTOFIX_PRE_STEP, _HANDOFF_STEP),
+    )
 
 
 def make_shell_harness(testcase, **config):
