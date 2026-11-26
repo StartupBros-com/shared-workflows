@@ -708,8 +708,6 @@ class MergeTests(SweepCase):
         self.assertEqual(status, 'pr-open')
         self.assertIn('#12 not merged: %s (1 file(s))' % why, text)
 
-    # --- switch -----------------------------------------------------------
-
     def test_merging_disabled_leaves_rows_and_calls_as_they_were(self):
         gh, _sc, _name = self.case()
         code, text = self.sweep(gh, apply=True, merge=False)
@@ -733,8 +731,6 @@ class MergeTests(SweepCase):
         self.assertIn('#7 (1 file(s)), first license: merge by hand', text)
         self.assertEqual((code, self.sleeps), (1, []))
 
-    # --- the happy paths ----------------------------------------------------
-
     def test_open_pull_request_with_green_checks_is_merged_at_the_checked_head(self):
         gh, _sc, _name = self.case()
         code, text, status = self.run_merge(gh)
@@ -745,8 +741,6 @@ class MergeTests(SweepCase):
         self.assertNotIn('first license', text)
         self.assertEqual(self.sleeps, [])
 
-    # --- never in the run that opened it, never in its first ten minutes --------
-
     def test_pull_request_opened_in_this_run_is_never_merged_in_that_run(self):
         # Checks start a moment after a pull request exists. Until they do GitHub
         # reports none, which reads the same as all green. The scripted pull
@@ -756,7 +750,6 @@ class MergeTests(SweepCase):
         self.assertNoMerge(gh)
         self.assertEqual((code, status, self.sleeps), (0, 'pr-opened', []))
         self.assertIn('#7 waits: opened in this run: a later run merges it (1 file(s))', text)
-        # Nothing was read about it beyond the license check made when it was opened.
         self.assertEqual([p for p in gh.gets if '/pulls/7' in p or '/commits/' in p], [])
         self.assertEqual(len([p for p in gh.gets if '/license?ref=' in p]), 1)
 
@@ -783,15 +776,11 @@ class MergeTests(SweepCase):
         code, _text, status = self.run_merge(gh)
         self.assertEqual((code, status), (0, 'merged'))
 
-    # --- G2 -----------------------------------------------------------------
-
     def test_open_decision_refuses(self):
         gh, _sc, _name = self.case(extra={'package.json': '{"license": "ISC"}'})
         code, text, status = self.run_merge(gh)
         self.assertRefused(gh, text, status, 'a decision is open')
         self.assertEqual(code, 2)
-
-    # --- G3 -----------------------------------------------------------------
 
     def test_draft_refuses(self):
         gh, sc, _name = self.case()
@@ -827,8 +816,6 @@ class MergeTests(SweepCase):
         _code, text, status = self.run_merge(gh)
         self.assertRefused(gh, text, status, 'its branch is not the sweep\'s own branch')
 
-    # --- G4 -----------------------------------------------------------------
-
     def test_first_license_opened_in_this_run_is_never_merged(self):
         gh, _sc, _name = self.case(first=True, existing=False, age_hours=48)
         code, text, status = self.run_merge(gh)
@@ -863,8 +850,6 @@ class MergeTests(SweepCase):
                 if not merges:
                     self.assertIn('#12 waits: first license: merges once', text)
 
-    # --- G5 -----------------------------------------------------------------
-
     def test_an_extra_file_refuses(self):
         gh, sc, _name = self.case()
         sc.files.append({'filename': 'README.md', 'status': 'modified', 'sha': git_blob('x')})
@@ -898,8 +883,6 @@ class MergeTests(SweepCase):
         self.assertNoMerge(gh)
         self.assertIn('#12 not merged: merge refused: more than 100 entries at ', text)
 
-    # --- G6 -----------------------------------------------------------------
-
     def test_wrong_license_detected_on_the_branch_refuses(self):
         gh, _sc, _name = self.case()
         gh.detected_on_branch = 'NOASSERTION'
@@ -911,8 +894,6 @@ class MergeTests(SweepCase):
         gh.fail = {'/license'}
         _code, text, status = self.run_merge(gh)
         self.assertRefused(gh, text, status, 'GitHub does not detect MIT on the branch')
-
-    # --- G7 -----------------------------------------------------------------
 
     def review(self, who, state):
         return {'user': {'login': who}, 'state': state}
@@ -935,8 +916,6 @@ class MergeTests(SweepCase):
         sc.reviews = [self.review('bob', 'CHANGES_REQUESTED'), self.review('bob', 'DISMISSED')]
         _code, _text, status = self.run_merge(gh)
         self.assertEqual(status, 'merged')
-
-    # --- what changes while the sweep waits for checks -------------------------
 
     RUNNING = {'name': 'test', 'status': 'in_progress', 'conclusion': None}
     DONE = {'name': 'test', 'status': 'completed', 'conclusion': 'success'}
@@ -966,8 +945,6 @@ class MergeTests(SweepCase):
                 sc.check_runs = [[self.RUNNING], [self.DONE]]
                 _code, text, status = self.run_merge(gh, during_wait=lambda: change(sc))
                 self.assertRefused(gh, text, status, why)
-
-    # --- G8 -----------------------------------------------------------------
 
     def test_failed_check_run_refuses(self):
         gh, sc, _name = self.case()
@@ -1117,8 +1094,6 @@ class MergeTests(SweepCase):
         self.assertEqual(text.count('checks are still running'), 2)
         self.assertEqual(code, 0)
 
-    # --- G9 -----------------------------------------------------------------
-
     def test_merge_queue_enqueues_the_checked_head_and_skips_the_direct_merge(self):
         gh, _sc, _name = self.case()
         gh.scripts['drift'].rules = [{'type': 'pull_request'}, {'type': 'merge_queue'}]
@@ -1163,8 +1138,6 @@ class MergeTests(SweepCase):
                 self.assertIn('#12 not merged: merge refused: GitHub\'s answer to the merge call '
                               'could not be read; the pull request may have merged', text)
 
-    # --- G10 ----------------------------------------------------------------
-
     def test_merge_call_that_raises_is_refused_with_the_reason(self):
         gh, _sc, _name = self.case()
         gh.fail = {'/pulls/12/merge'}
@@ -1200,8 +1173,6 @@ class MergeTests(SweepCase):
         self.assertNoMerge(gh)
         self.assertEqual((code, status), (1, 'pr-open'))
         self.assertIn('merge refused: unexpected answer from GitHub', text)
-
-    # --- the pull request body ------------------------------------------------
 
     def opened_body(self, first, merge):
         gh, _sc, _name = self.case(first=first, existing=False)
