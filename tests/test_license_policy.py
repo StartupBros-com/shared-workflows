@@ -42,14 +42,14 @@ APACHE = textwrap.dedent('''\
     ''')
 
 
-def policy(repos=None, merge=False, **holder):
+def policy(repos=None, merge=False, refix=None, **holder):
     return lp.Policy(
         name=holder.get('name', 'Example Holdings LLC'),
         brand=holder.get('brand', 'Example Brand'),
         url=holder.get('url', 'https://example.test'),
         aliases=('Example Holdings', 'Example Holdings LLC', 'Example Holdings / Example Brand'),
         license='MIT', owner_logins=frozenset({'owner'}), org='example-org', repos=repos or {},
-        merge=merge)
+        merge=merge, refix_after_days=refix)
 
 
 def mit(*notices, title='MIT License\n\n'):
@@ -333,6 +333,19 @@ class PolicyFileTests(unittest.TestCase):
         self.assertIs(self.load('[holder]\nname = "X"\n[sweep]\nmerge = true\n').merge, True)
         self.assertIs(self.load('[holder]\nname = "X"\n[sweep]\nmerge = false\n').merge, False)
 
+    def test_refix_setting_is_off_unless_given(self):
+        self.assertIsNone(self.load('[holder]\nname = "X"\n').refix_after_days)
+        self.assertIsNone(self.load('[holder]\nname = "X"\n[sweep]\nmerge = true\n').refix_after_days)
+        self.assertEqual(
+            self.load('[holder]\nname = "X"\n[sweep]\nrefix_after_days = 7\n').refix_after_days, 7)
+        self.assertEqual(
+            self.load('[holder]\nname = "X"\n[sweep]\nrefix_after_days = 1\n').refix_after_days, 1)
+
+    def test_refix_setting_must_be_a_whole_number_of_days_one_or_more(self):
+        for value in ('0', '-1', '1.5', '7.0', '"7"', 'true', 'false', '[7]'):
+            with self.assertRaises(lp.PolicyError, msg=value):
+                self.load('[holder]\nname = "X"\n[sweep]\nrefix_after_days = %s\n' % value)
+
     def test_merge_switch_must_be_a_boolean(self):
         for value in ('"yes"', '1', '"true"'):
             with self.assertRaises(lp.PolicyError, msg=value):
@@ -415,6 +428,7 @@ class FakeGh:
         # for by id. An exception in either place is raised by that read.
         self.detected_on_branch = detected_on_branch
         self.detected_by_id = detected_by_id
+        self.refs = {}          # (repository, branch) -> the commit that branch stands at
         self.posts = []
         self.gets = []
         self.cloned = []
@@ -448,7 +462,12 @@ class FakeGh:
         if '/contributors' in path:
             return self.contributors.get(name, [['User', 'owner']])
         if '/git/matching-refs/' in path:
-            return []
+            # As GitHub answers it: every ref whose name starts with what was asked for.
+            prefix = path.split('/git/matching-refs/heads/')[1]
+            found = sorted((branch, tip) for (owner, branch), tip in self.refs.items()
+                           if owner == name and branch.startswith(prefix))
+            return [['refs/heads/' + branch, tip] if 'object.sha' in jq else 'refs/heads/' + branch
+                    for branch, tip in found]
         if '/pulls?state=all' in path:
             branch = path.split('head=example-org:')[1].split('&')[0]
             return self.pulls.get((name, branch), [])
@@ -488,6 +507,8 @@ class FakeGh:
     def post(self, path, body, method='POST'):
         self.posts.append((method, path, body))
         self._maybe_fail(path)
+        if path.endswith('/git/refs'):
+            self.refs[(path.split('/')[2], body['ref'][len('refs/heads/'):])] = body['sha']
         if path.endswith('/pulls'):
             return {'number': 7}
         reply = {'sha': 'f' * 40}
@@ -544,7 +565,8 @@ class SweepCase(unittest.TestCase):
             path.write_text(text, encoding='utf-8')
         self.trees[name] = str(root)
 
-    def sweep(self, gh, apply=False, repos=None, merge=False, during_wait=None):
+    def sweep(self, gh, apply=False, repos=None, merge=False, during_wait=None, refix=None,
+              now=None):
         """`during_wait` runs inside each sleep: what changes on GitHub while the sweep waits."""
         def sleep(seconds):
             self.sleeps.append(seconds)
@@ -555,8 +577,8 @@ class SweepCase(unittest.TestCase):
                 during_wait()
         out = io.StringIO()
         work = tempfile.mkdtemp(prefix='work-', dir=self.base)
-        code = lp.sweep(gh, policy(repos, merge=merge), apply=apply, out=out, workdir=work,
-                        now=NOW, sleep=sleep)
+        code = lp.sweep(gh, policy(repos, merge=merge, refix=refix), apply=apply, out=out,
+                        workdir=work, now=now or NOW, sleep=sleep)
         self.assertEqual(gh.unexpected, [])
         self.assertLessEqual(len(self.sleeps), 60, 'the wait never ends')
         return code, out.getvalue()
@@ -731,6 +753,227 @@ class SweepTests(SweepCase):
                                 repos={'theirs': {'mode': 'hands-off', 'reason': 'derived work'}})
         self.assertEqual((code, gh.cloned, gh.posts), (0, [], []))
         self.assertIn('derived work', text)
+
+
+WEEK = 7 * 24      # hours
+
+
+class RefixTests(SweepCase):
+    """A file that differs again after the sweep's pull request for it merged."""
+
+    def drifted(self, pulls):
+        self.tree('drift', {'LICENSE': mit('Copyright (c) 2026 Example Holdings')})
+        self.writes = {'LICENSE': mit(OURS)}
+        self.branch = lp.BRANCH_PREFIX + lp.digest_of(self.writes)
+        return FakeGh([repo('drift')], self.trees, pulls={('drift', self.branch): pulls})
+
+    def opened(self, gh):
+        return [path for _m, path, _b in gh.posts]
+
+    OPENING = ['repos/example-org/drift/git/trees', 'repos/example-org/drift/git/commits',
+               'repos/example-org/drift/git/refs', 'repos/example-org/drift/pulls']
+
+    def test_a_change_merged_long_enough_ago_is_made_again_and_not_merged_in_that_run(self):
+        gh = self.drifted([[3, 'closed', ago(hours=WEEK + 1)]])
+        code, text = self.sweep(gh, apply=True, merge=True, refix=7)
+        self.assertEqual(self.opened(gh), self.OPENING)
+        self.assertEqual(gh.posts[2][2]['ref'], 'refs/heads/' + self.branch)
+        body = gh.posts[3][2]['body']
+        self.assertIn('This repeats #3,', body)
+        self.assertIn('at most once every 7 days', body)
+        self.assertIn('close this pull request', body)
+        self.assertEqual(gh.merge_calls(), [])
+        self.assertIn('pr-opened', text)
+        self.assertIn('#7 waits: opened in this run', text)
+        self.assertIn('again after #3', text)
+        self.assertEqual(code, 0)
+
+    def test_the_limit_is_reached_at_exactly_that_many_days_and_not_a_minute_sooner(self):
+        gh = self.drifted([[3, 'closed', ago(hours=WEEK)]])
+        self.sweep(gh, apply=True, refix=7)
+        self.assertEqual(self.opened(gh), self.OPENING)
+
+        gh = self.drifted([[3, 'closed', ago(hours=WEEK - 1, minutes=59)]])
+        code, text = self.sweep(gh, apply=True, merge=True, refix=7)
+        self.assertEqual(gh.posts, [])
+        self.assertIn('needs-decision', text)
+        self.assertIn('#3 merged but the tree still differs: the sweep makes the change again '
+                      'from 2026-11-26 12:01 UTC', text)
+        self.assertEqual(code, 2)
+
+    def test_the_number_of_days_is_the_policy_s_own(self):
+        gh = self.drifted([[3, 'closed', ago(hours=3 * 24)]])
+        self.sweep(gh, apply=True, refix=7)
+        self.assertEqual(gh.posts, [])
+        gh = self.drifted([[3, 'closed', ago(hours=3 * 24)]])
+        self.sweep(gh, apply=True, refix=3)
+        self.assertEqual(self.opened(gh), self.OPENING)
+        self.assertIn('at most once every 3 days', gh.posts[3][2]['body'])
+
+    def test_without_the_setting_a_merged_change_is_never_made_again(self):
+        gh = self.drifted([[3, 'closed', ago(hours=365 * 24)]])
+        code, text = self.sweep(gh, apply=True, merge=True)
+        self.assertEqual(gh.posts, [])
+        self.assertIn('#3 merged but the tree still differs', text)
+        self.assertNotIn('makes the change again', text)
+        self.assertEqual(code, 2)
+
+    def test_report_mode_says_it_would_make_the_change_again_and_writes_nothing(self):
+        gh = self.drifted([[3, 'closed', ago(hours=WEEK + 1)]])
+        code, text = self.sweep(gh, apply=False, refix=7)
+        self.assertEqual(gh.posts, [])
+        self.assertIn('would-open-pr', text)
+        self.assertIn('again after #3', text)
+        self.assertEqual(code, 1)
+
+    def test_a_first_time_change_does_not_claim_to_repeat_anything(self):
+        gh = self.drifted([])
+        code, text = self.sweep(gh, apply=True, refix=7)
+        self.assertEqual(self.opened(gh), self.OPENING)
+        self.assertNotIn('repeats', gh.posts[3][2]['body'])
+        self.assertNotIn('again after', text)
+
+    def test_the_newest_pull_request_decides_and_a_closed_one_stays_final(self):
+        old_merge = ago(hours=30 * 24)
+        for pulls in ([[9, 'closed', None], [3, 'closed', old_merge]],
+                      [[3, 'closed', old_merge], [9, 'closed', None]]):
+            with self.subTest(order=[row[0] for row in pulls]):
+                gh = self.drifted(pulls)
+                code, text = self.sweep(gh, apply=True, merge=True, refix=7)
+                self.assertEqual(gh.posts, [])
+                self.assertIn('#9 was closed without merging', text)
+                self.assertNotIn('#3', text)
+                self.assertEqual(code, 2)
+
+    def test_a_merge_newer_than_an_older_refusal_is_what_counts(self):
+        for pulls in ([[9, 'closed', ago(hours=WEEK + 1)], [3, 'closed', None]],
+                      [[3, 'closed', None], [9, 'closed', ago(hours=WEEK + 1)]]):
+            with self.subTest(order=[row[0] for row in pulls]):
+                gh = self.drifted(pulls)
+                _code, text = self.sweep(gh, apply=True, refix=7)
+                self.assertEqual(self.opened(gh), self.OPENING)
+                self.assertIn('again after #9', text)
+
+    def test_the_newest_merge_sets_the_clock_not_an_older_one(self):
+        gh = self.drifted([[3, 'closed', ago(hours=30 * 24)], [9, 'closed', ago(hours=24)]])
+        code, text = self.sweep(gh, apply=True, refix=7)
+        self.assertEqual(gh.posts, [])
+        self.assertIn('#9 merged but the tree still differs', text)
+        self.assertEqual(code, 2)
+
+    def test_a_merge_date_that_cannot_be_read_or_lies_ahead_is_never_due(self):
+        for merged in ('last week', '2026-11-01', '2026-11-01T00:00:00+00:00', 20261101, True,
+                       ['2026-11-01T00:00:00Z'], ago(hours=-1), ago(hours=-365 * 24)):
+            with self.subTest(merged=merged):
+                gh = self.drifted([[3, 'closed', merged]])
+                code, text = self.sweep(gh, apply=True, merge=True, refix=7)
+                self.assertEqual(gh.posts, [])
+                self.assertIn('#3 merged but the tree still differs', text)
+                self.assertEqual(code, 2)
+
+    def test_an_open_pull_request_is_not_held_back_by_an_older_merge(self):
+        gh = self.drifted([[9, 'open', None], [3, 'closed', ago(hours=24)]])
+        gh.arm('drift', self.branch, self.writes)
+        code, text = self.sweep(gh, apply=True, merge=True, refix=7)
+        self.assertEqual([path for _m, path, _b in gh.merge_calls()],
+                         ['repos/example-org/drift/pulls/9/merge'])
+        self.assertIn('#9 merged', text)
+        self.assertEqual(code, 0)
+
+    def test_a_branch_left_where_the_merged_pull_request_ended_is_reported_and_not_moved(self):
+        for apply in (True, False):
+            with self.subTest(apply=apply):
+                gh = self.drifted([[3, 'closed', ago(hours=WEEK + 1)]])
+                gh.arm('drift', self.branch, self.writes)       # #3 ended at HEAD_SHA
+                gh.refs[('drift', self.branch)] = HEAD_SHA
+                code, text = self.sweep(gh, apply=apply, merge=True, refix=7)
+                self.assertEqual(gh.posts, [])
+                self.assertIn('needs-decision', text)
+                self.assertIn('#3 merged and the tree differs again, but its branch %s is still '
+                              'there' % self.branch, text)
+                self.assertEqual(gh.refs, {('drift', self.branch): HEAD_SHA})
+                self.assertEqual(code, 2)
+
+    def test_a_left_over_branch_is_not_looked_for_until_the_change_is_due(self):
+        gh = self.drifted([[3, 'closed', ago(hours=24)]])
+        gh.arm('drift', self.branch, self.writes)
+        gh.refs[('drift', self.branch)] = HEAD_SHA
+        _code, text = self.sweep(gh, apply=True, refix=7)
+        self.assertIn('#3 merged but the tree still differs: the sweep makes the change again', text)
+        self.assertEqual(gh.gets, [])
+
+    def test_only_the_branch_of_that_exact_name_counts_as_left_over(self):
+        gh = self.drifted([[3, 'closed', ago(hours=WEEK + 1)]])
+        gh.arm('drift', self.branch, self.writes)
+        gh.refs[('drift', self.branch + '-kept-by-someone')] = HEAD_SHA
+        _code, text = self.sweep(gh, apply=True, refix=7)
+        self.assertEqual(self.opened(gh), self.OPENING)
+        self.assertIn('again after #3', text)
+
+    def test_a_left_over_branch_that_cannot_be_compared_stops_the_change(self):
+        gh = self.drifted([[3, 'closed', ago(hours=WEEK + 1)]])
+        gh.arm('drift', self.branch, self.writes)
+        gh.refs[('drift', self.branch)] = HEAD_SHA
+        gh.fail = {'/pulls/3'}
+        code, text = self.sweep(gh, apply=True, merge=True, refix=7)
+        self.assertEqual(gh.posts, [])
+        self.assertIn('error', text)
+        self.assertEqual(code, 2)
+
+    def test_a_branch_made_by_a_run_that_failed_to_open_is_used_by_the_next_run(self):
+        gh = self.drifted([[3, 'closed', ago(hours=WEEK + 1)]])
+        gh.arm('drift', self.branch, self.writes)               # #3 ended at HEAD_SHA
+        gh.fail = {'/pulls'}
+        code, text = self.sweep(gh, apply=True, merge=True, refix=7)
+        self.assertEqual(self.opened(gh), self.OPENING)
+        self.assertIn('error', text)
+        self.assertEqual(code, 2)
+        made = gh.refs[('drift', self.branch)]
+        self.assertNotEqual(made, HEAD_SHA)
+
+        gh.fail, before = set(), len(gh.posts)
+        code, text = self.sweep(gh, apply=True, merge=True, refix=7)
+        self.assertEqual(self.opened(gh)[before:], ['repos/example-org/drift/pulls'])
+        self.assertIn('This repeats #3,', gh.posts[-1][2]['body'])
+        self.assertEqual(gh.refs[('drift', self.branch)], made)
+        self.assertIn('pr-opened', text)
+        self.assertNotIn('is still there', text)
+        self.assertEqual(code, 0)
+
+    def test_a_deleted_first_license_is_put_back_under_the_first_license_hold(self):
+        self.tree('bare', {'README.md': 'x\n'})
+        writes = {'LICENSE': mit(OURS.replace('2026', '2025'))}
+        branch = lp.BRANCH_PREFIX + lp.digest_of(writes)
+        gh = FakeGh([repo('bare', license=None)], self.trees,
+                    pulls={('bare', branch): [[3, 'closed', ago(hours=WEEK + 1)]]})
+        code, text = self.sweep(gh, apply=True, merge=True, refix=7)
+        body = [b for _m, p, b in gh.posts if p.endswith('/pulls')][0]['body']
+        self.assertIn('This repeats #3,', body)
+        self.assertIn('had no license', body)
+        self.assertIn('first license: merges once the pull request is 20 hours old', text)
+        self.assertEqual(gh.merge_calls(), [])
+
+    def test_the_real_clock_is_used_when_the_caller_gives_no_time(self):
+        for merged, expected in (('2000-01-01T00:00:00Z', 'would-open-pr'),
+                                 ('2999-01-01T00:00:00Z', 'needs-decision')):
+            with self.subTest(merged=merged):
+                gh = self.drifted([[3, 'closed', merged]])
+                out = io.StringIO()
+                lp.sweep(gh, policy(refix=7), apply=False, out=out,
+                         workdir=tempfile.mkdtemp(prefix='work-', dir=self.base))
+                self.assertIn(expected, out.getvalue())
+                self.assertNotIn('error', out.getvalue())
+
+    def test_due_is_decided_by_the_merge_date_the_days_and_now_alone(self):
+        seven = policy(refix=7)
+        merged = '2026-11-19T12:00:00Z'
+        self.assertEqual(lp.refix_due(seven, merged, NOW), (True, ''))
+        self.assertEqual(lp.refix_due(seven, merged, NOW - datetime.timedelta(seconds=1)),
+                         (False, ': the sweep makes the change again from 2026-11-26 12:00 UTC'))
+        self.assertEqual(lp.refix_due(policy(), merged, NOW), (False, ''))
+        self.assertEqual(lp.refix_due(policy(refix=8), merged, NOW)[0], False)
+        self.assertEqual(lp.refix_due(seven, None, NOW), (False, ''))
+        self.assertEqual(lp.refix_due(seven, '9999-12-31T23:59:59Z', NOW), (False, ''))
 
 
 class MergeHelperTests(unittest.TestCase):

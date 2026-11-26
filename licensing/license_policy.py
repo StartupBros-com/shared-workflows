@@ -91,6 +91,7 @@ class Policy:
     org: str
     repos: dict
     merge: bool = False
+    refix_after_days: int | None = None
 
     @property
     def holder_text(self):
@@ -138,10 +139,13 @@ def load_policy(path=DEFAULT_POLICY):
     provenance = raw.get('provenance', {})
     _only(provenance, ('owner_logins',), '[provenance]')
     sweep = raw.get('sweep', {})
-    _only(sweep, ('org', 'merge'), '[sweep]')
+    _only(sweep, ('org', 'merge', 'refix_after_days'), '[sweep]')
     merge = sweep.get('merge', False)
     if not isinstance(merge, bool):
         raise PolicyError('[sweep] merge must be true or false')
+    refix = sweep.get('refix_after_days')
+    if refix is not None and (isinstance(refix, bool) or not isinstance(refix, int) or refix < 1):
+        raise PolicyError('[sweep] refix_after_days must be a whole number of days, 1 or more')
     repos = raw.get('repos', {})
     for name, entry in repos.items():
         where = '[repos.%s]' % name
@@ -156,7 +160,7 @@ def load_policy(path=DEFAULT_POLICY):
         name=holder['name'], brand=holder.get('brand', ''), url=holder.get('url', ''),
         aliases=tuple(holder.get('aliases', ())), license=license_id,
         owner_logins=frozenset(provenance.get('owner_logins', ())),
-        org=sweep.get('org', ''), repos=repos, merge=merge)
+        org=sweep.get('org', ''), repos=repos, merge=merge, refix_after_days=refix)
 
 
 def _norm(text):
@@ -473,12 +477,18 @@ def digest_of(writes):
     return hashlib.sha256(blob).hexdigest()[:10]
 
 
-def pr_body(policy, plan, detected, same_as_base=False):
+def pr_body(policy, plan, detected, same_as_base=False, again=None):
     lines = ['Opened by the org license sweep (`licensing/` in shared-workflows).', '',
              'What changes:', '']
     for f in plan.findings:
         if f.level == 'fix':
             lines.append('- `%s`: %s' % (f.path, f.message))
+    if again:
+        lines += ['', 'This repeats #%d, which made the same change. The file has been changed '
+                      'again since then. The sweep makes the same change at most once every %d '
+                      'days. To keep the file as it is now, close this pull request: the sweep '
+                      'then opens no more of them and reports the difference instead.'
+                  % (again, policy.refix_after_days)]
     lines += ['', 'The copyright line the policy writes is:', '',
               '    Copyright (c) <year> %s' % policy.holder_text, '',
               'The license text is the unmodified standard text.']
@@ -574,11 +584,12 @@ def branch_detection(gh, policy, repo, api, plan, branch, base_sha, template=Non
     return seen, accepted
 
 
-def open_pull_request(gh, policy, org, repo, tree, plan, branch, template=None):
+def open_pull_request(gh, policy, org, repo, tree, plan, branch, template=None, again=None):
     """Create the branch and pull request through the API.
 
     Returns (number, detected, accepted): what GitHub names on the new branch
     and whether branch_detection accepts it. Both are None for a first license.
+    `again` is the merged pull request this one repeats, if any.
     """
     name = repo['name']
     base_sha = _git(tree, 'rev-parse', 'HEAD')
@@ -604,7 +615,7 @@ def open_pull_request(gh, policy, org, repo, tree, plan, branch, template=None):
         'title': 'chore: apply the org license policy', 'head': branch,
         'base': repo['default_branch'],
         'body': pr_body(policy, plan, detected,
-                        same_as_base=bool(accepted) and detected == UNNAMED)})
+                        same_as_base=bool(accepted) and detected == UNNAMED, again=again)})
     stale = gh.lines(api + '/pulls?state=open&per_page=100',
                      '.[] | select(.head.repo.full_name == "%s/%s") | [.number, .head.ref]'
                      % (org, name))
@@ -882,6 +893,43 @@ def try_merge(gh, policy, org, repo, plan, branch, number, decisions, budget, no
         return _refused('unexpected error (%s)' % _named(exc))
 
 
+def refix_due(policy, merged_at, now):
+    """(due, note) for a change whose newest pull request merged at `merged_at`
+    and whose file differs again.
+
+    The sweep makes the same change at most once in policy.refix_after_days
+    days. This is a limit on how often, not a judgement of why the file
+    changed: a file changed straight back is reported until the days are up,
+    then changed again. Without the setting nothing is ever due. A merge date
+    that cannot be read is never due, and neither is one in the future.
+    """
+    days = policy.refix_after_days
+    if not days:
+        return False, ''
+    try:
+        due_at = _parse_time(merged_at) + datetime.timedelta(days=days)
+    except (TypeError, ValueError, OverflowError):
+        return False, ''
+    if now >= due_at:
+        return True, ''
+    return False, ': the sweep makes the change again from %s' % due_at.strftime('%Y-%m-%d %H:%M UTC')
+
+
+def left_over(gh, api, branch, number):
+    """Whether the branch still stands exactly where merged pull request `number` left it.
+
+    Such a branch cannot carry the change again. Its commit starts from the
+    default branch as it was before that merge, so a second pull request from
+    it conflicts with the edit made since. A branch that stands anywhere else
+    was made by a later run whose pull request then failed to open, and
+    open_pull_request uses it as it is.
+    """
+    tips = dict(gh.lines('%s/git/matching-refs/heads/%s' % (api, branch),
+                         '.[] | [.ref, .object.sha]'))
+    tip = tips.get('refs/heads/' + branch)
+    return tip is not None and tip == gh.get('%s/pulls/%d' % (api, number))['head']['sha']
+
+
 def merge_row(name, open_status, number, outcome, summary, first_license, decisions):
     if outcome.status == 'merged':
         return Row(name, 'merged', '#%d merged (%s)%s' % (
@@ -902,6 +950,7 @@ def sweep_repo(gh, policy, org, repo, workdir, apply, template, budget=None, now
     detected = repo.get('license')
     merging = apply and policy.merge
     budget = budget or WaitBudget()
+    now = now or datetime.datetime.now(datetime.timezone.utc)
     if repo.get('archived'):
         return Row(name, 'skipped', 'archived')
     if repo.get('fork'):
@@ -937,16 +986,31 @@ def sweep_repo(gh, policy, org, repo, workdir, apply, template, budget=None, now
                                  plan.first_license, decisions)
             return Row(name, 'pr-open', '#%d waits for a merge (%s)' % (number, summary),
                        decisions, red=True)
+    again = None
     if pulls:
-        number, _state, merged = pulls[0]
-        why = ('#%d merged but the tree still differs' % number if merged else
-               '#%d was closed without merging; add a [repos.%s] entry or reopen it' % (number, name))
-        return Row(name, 'needs-decision', '',
-                   decisions + [Finding('decide', 'LICENSE', why)], red=True)
+        # None is open. The newest one decides: a pull request closed without
+        # merging is a person saying no, and stays final however old it is.
+        number, _state, merged = max(pulls, key=lambda row: row[0])
+        if not merged:
+            why = '#%d was closed without merging; add a [repos.%s] entry or reopen it' % (
+                number, name)
+        else:
+            due, note = refix_due(policy, merged, now)
+            why = '#%d merged but the tree still differs%s' % (number, note)
+            if due and left_over(gh, api, branch, number):
+                why = ('#%d merged and the tree differs again, but its branch %s is still '
+                       'there; delete that branch and the sweep makes the change again'
+                       % (number, branch))
+            elif due:
+                why, again = '', number
+        if why:
+            return Row(name, 'needs-decision', '',
+                       decisions + [Finding('decide', 'LICENSE', why)], red=True)
+        summary += ', again after #%d' % again
     if not apply:
         return Row(name, 'would-open-pr', summary, plan.findings, red=True)
     number, seen, accepted = open_pull_request(gh, policy, org, repo, tree, plan, branch,
-                                               template)
+                                               template, again=again)
     if not plan.first_license and not accepted:
         decisions.append(Finding('decide', 'LICENSE', 'GitHub detects %s on %s instead of %s'
                                  % (seen or 'nothing', branch, rp.license)))
