@@ -615,6 +615,21 @@ class SweepTests(SweepCase):
         self.assertIn('#3 was closed without merging', text)
         self.assertEqual(code, 2)
 
+    def test_a_change_whose_pull_request_already_merged_is_reported_not_opened_again(self):
+        # Seen on the runner, 2026-11-26 (home-infrastructure run 45739098708): the
+        # file had drifted back after the sweep's pull request for the same change
+        # merged. Someone changed it, so it is theirs to settle.
+        self.tree('drift', {'LICENSE': mit('Copyright (c) 2026 Example Holdings')})
+        branch = lp.BRANCH_PREFIX + lp.digest_of({'LICENSE': mit(OURS)})
+        gh = FakeGh([repo('drift')], self.trees,
+                    pulls={('drift', branch): [[3, 'closed', '2026-11-25T23:00:00Z']]})
+        code, text = self.sweep(gh, apply=True)
+        self.assertEqual(gh.posts, [])
+        self.assertIn('needs-decision', text)
+        self.assertIn('#3 merged but the tree still differs', text)
+        self.assertNotIn('closed without merging', text)
+        self.assertEqual(code, 2)
+
     def test_a_superseded_pull_request_is_closed_with_a_pointer(self):
         self.tree('drift', {'LICENSE': mit('Copyright (c) 2026 Example Holdings')})
         gh = FakeGh([repo('drift')], self.trees,
