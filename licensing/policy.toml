@@ -1,0 +1,63 @@
+# License policy for every public repository in the org.
+#
+# license_policy.py reads this file and nothing else states the policy. Edit it
+# here; the scheduled sweep opens a pull request in each repository that
+# differs and merges it on a later run. See README.md in this directory.
+
+[holder]
+# The copyright line the tool writes is:
+#   Copyright (c) <year> <name> (<brand>, <url>)
+# `brand` and `url` are optional. The MIT license requires every copy to keep
+# this line, so it is the one string that travels with the code.
+name = "StartupBros LLC"
+brand = "House of Vibe"
+url = "https://houseofvibe.ai"
+
+# Earlier spellings of the same holder. A copyright line naming one of these is
+# rewritten to the line above. A line naming anyone else is never touched.
+aliases = [
+  "StartupBros",
+  "StartupBros LLC",
+  "StartupBros / House of Vibe",
+  # The placeholder synthetic-panel was published with. Every commit there is ours.
+  "synthetic-panel contributors",
+]
+
+[defaults]
+license = "MIT"
+
+[provenance]
+# A first LICENSE is only written into a repository when every commit author
+# is one of these GitHub logins or a bot, and the tree has no UPSTREAM.md.
+owner_logins = ["StartupBros"]
+
+[sweep]
+org = "StartupBros-com"
+# The sweep merges the pull requests it opened, once the guards listed under
+# "Merging" in README.md all hold. Remove this line and it only opens them.
+merge = true
+# A license file that differs again after the sweep's pull request for it
+# merged is put back by a new pull request, and the same change is made at most
+# once in this many days. Sooner than that the sweep reports it and the run is
+# red. Remove this line and it only ever reports.
+refix_after_days = 7
+
+# Per-repository exceptions. Keys:
+#   mode     = "hands-off"   the tool neither checks nor writes; needs a reason
+#   reason   = "..."         why the exception exists
+#   license  = "Apache-2.0"  keep this license instead of the default
+#   subtrees = ["plugins/*"] directories shipped on their own; each gets a copy
+#                            of the root LICENSE if it has no license file
+
+[repos.hov-stack]
+subtrees = ["plugins/*"]
+
+[repos.whygraph]
+mode = "hands-off"
+license = "Apache-2.0"
+reason = "Contest entry published as Apache-2.0, judged after 2026-12-11. Holder line reads 'whygraph contributors'."
+
+[repos.plain-english-margin]
+mode = "hands-off"
+license = "Apache-2.0"
+reason = "Contest entry published as Apache-2.0. Leave as submitted until judged."
