@@ -284,24 +284,35 @@ class Plan:
         return 2 if self.decisions else (1 if self.writes else 0)
 
 
-def tracked_files(tree):
-    """Regular files in the tree: git's tracked list when it is a checkout."""
+def _tree_paths(tree):
+    """Return regular paths and link paths separately; never read through a link."""
     if os.path.exists(os.path.join(tree, '.git')):
-        out = subprocess.run(['git', '-C', tree, 'ls-files', '-z'], check=True,
+        out = subprocess.run(['git', '-C', tree, 'ls-files', '--stage', '-z'], check=True,
                              capture_output=True).stdout.decode('utf-8', 'surrogateescape')
-        names = [p for p in out.split('\0') if p]
+        names = {}
+        for entry in filter(None, out.split('\0')):
+            meta, rel = entry.split('\t', 1)
+            names[rel] = names.get(rel, False) or meta.startswith('120000 ')
     else:
-        names = []
+        names = {}
         for base, dirs, files in os.walk(tree):
             dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
-            for name in files:
-                names.append(os.path.relpath(os.path.join(base, name), tree).replace(os.sep, '/'))
-    keep = []
-    for rel in sorted(names):
+            links = [d for d in dirs if os.path.islink(os.path.join(base, d))]
+            dirs[:] = [d for d in dirs if d not in links]
+            for name in files + links:
+                names[os.path.relpath(os.path.join(base, name), tree).replace(os.sep, '/')] = False
+    regular, symlinks = [], []
+    for rel, tracked_link in sorted(names.items()):
         full = os.path.join(tree, rel)
-        if os.path.isfile(full) and not os.path.islink(full):
-            keep.append(rel)
-    return keep
+        if tracked_link or os.path.islink(full):
+            symlinks.append(rel)
+        elif os.path.isfile(full):
+            regular.append(rel)
+    return regular, symlinks
+
+
+def tracked_files(tree):
+    return _tree_paths(tree)[0]
 
 
 def _read(tree, rel):
@@ -350,13 +361,18 @@ def plan_tree(tree, policy, repo, facts, template=None):
         plan.writes[path] = text
         plan.findings.append(Finding('fix', path, message))
 
-    files = tracked_files(tree)
+    files, symlinks = _tree_paths(tree)
+    license_links = [f for f in symlinks if LICENSE_LIKE.match(os.path.basename(f))]
+    root_links = [f for f in license_links if '/' not in f]
     fileset = set(files)
     root_like = [f for f in files if '/' not in f and LICENSE_LIKE.match(f)]
     root_name = next((n for n in MANAGED_NAMES if n in fileset), None)
     root_text = None    # canonical root LICENSE, when the root is entirely ours
 
-    if not root_like:
+    if root_links:
+        for rel in root_links:
+            decide(rel, 'license is a symlink; leave it for the owner')
+    elif not root_like:
         if rp.license not in WRITABLE:
             decide('LICENSE', 'missing, and this tool does not write %s' % rp.license)
         elif 'UPSTREAM.md' in fileset:
@@ -402,13 +418,20 @@ def plan_tree(tree, policy, repo, facts, template=None):
             if state in ('ours', 'mixed') and new != text:
                 write(rel, new, 'copyright line differs from the policy')
 
+    if rp.license == 'MIT':
+        for rel in license_links:
+            if '/' in rel and (os.path.basename(rel) in MANAGED_NAMES
+                              or any(_match_dir(rel.rsplit('/', 1)[0], p) for p in rp.subtrees)):
+                decide(rel, 'license is a symlink; leave it for the owner')
+
     if root_text is not None and rp.subtrees:
         dirs = sorted({rel.rsplit('/', n)[0] for rel in files
                        for n in range(1, rel.count('/') + 1)})
         for sub in dirs:
             if not any(_match_dir(sub, pattern) for pattern in rp.subtrees):
                 continue
-            inside = [f for f in files if f.startswith(sub + '/') and '/' not in f[len(sub) + 1:]]
+            inside = [f for f in files + license_links
+                      if f.startswith(sub + '/') and '/' not in f[len(sub) + 1:]]
             if not any(LICENSE_LIKE.match(os.path.basename(f)) for f in inside):
                 write(sub + '/LICENSE', root_text, 'missing; copy the root LICENSE')
 
