@@ -606,6 +606,25 @@ def _refused(text):
     return MergeOutcome('refused', 'merge refused: ' + (lines[0][:200] if lines else 'unknown error'))
 
 
+def _named(exc):
+    """An exception as text, whatever its own repr does."""
+    try:
+        return repr(exc)
+    except Exception:
+        return type(exc).__name__
+
+
+def _github_said_no(error):
+    """Whether the text of a failed gh call shows that GitHub answered and refused.
+
+    gh prints GitHub's own answer as "gh: <message> (HTTP <status>)", or as
+    "gh: <message>" for a GraphQL error. A 5xx, a network failure or anything
+    else does not say whether a write happened.
+    """
+    said = str(error).partition(' failed: ')[2]
+    return said.startswith('gh: ') and not re.search(r'\bHTTP 5\d\d\b', said)
+
+
 def _read_list(gh, path, key=None):
     """One full page of a list endpoint. A page that may be cut short is an error,
     because a check or review that was not read must not count as a pass."""
@@ -686,26 +705,29 @@ def _merge_decision(gh, policy, org, repo, plan, branch, number, decisions, budg
     api = 'repos/%s/%s' % (org, name)
     first_wait = ('first license: merges once the pull request is %d hours old'
                   % FIRST_LICENSE_HOLD_HOURS)
-    unread = 'GitHub\'s answer to the merge call could not be read; the pull request may have merged'
+    merged_doubt = 'the pull request may have merged'
+    queued_doubt = 'the pull request may be in the queue'
 
     def refuse(why):
         return MergeOutcome('refused', why)
 
-    def send(path, body, method='POST'):
-        """The merge or enqueue call. A RuntimeError is gh's own report that GitHub
-        refused or the call failed. Anything else leaves the outcome unknown, so
-        the refusal says the pull request may have merged."""
+    def send(path, body, doubt, method='POST'):
+        """The merge or enqueue call. GitHub's own refusal is raised as it stands.
+        Any other failure leaves the outcome unknown, and its reason leads with
+        the doubt, because _refused keeps only the first 200 characters."""
         try:
             reply = gh.post(path, body, method=method)
-        except RuntimeError:
-            raise
+        except RuntimeError as exc:
+            if _github_said_no(exc):
+                raise
+            raise RuntimeError('%s: %s' % (doubt, exc)) from None
         except ValueError:
-            raise RuntimeError(unread) from None
+            raise RuntimeError('%s: GitHub\'s answer could not be read' % doubt) from None
         except Exception as exc:
-            raise RuntimeError('the merge call failed unexpectedly (%r); the pull request '
-                               'may have merged' % (exc,)) from None
+            raise RuntimeError('%s: the call failed unexpectedly (%s)'
+                               % (doubt, _named(exc))) from None
         if not isinstance(reply, dict):
-            raise RuntimeError(unread)
+            raise RuntimeError('%s: GitHub\'s answer could not be read' % doubt)
         return reply
 
     if decisions:
@@ -721,14 +743,17 @@ def _merge_decision(gh, policy, org, repo, plan, branch, number, decisions, budg
     why = _pull_refusal(pull, org, repo, branch)
     if why:
         return refuse(why)
-    age = now - _parse_time(pull['created_at'])
+    opened, changed = _parse_time(pull['created_at']), _parse_time(pull['updated_at'])
+    if changed < opened:
+        return refuse('its last change is dated before it was opened')
+    age = now - opened
     stale = age > datetime.timedelta(hours=STALE_HOURS)
     if plan.first_license and age < datetime.timedelta(hours=FIRST_LICENSE_HOLD_HOURS):
         return MergeOutcome('waiting', first_wait, stale)
     # Measured from the last change, not from when it was opened: a new commit
     # on an old pull request ("Update branch") has no checks yet either, and
     # GitHub moves updated_at when the branch moves.
-    if now - _parse_time(pull['updated_at']) < datetime.timedelta(minutes=SETTLE_MINUTES):
+    if now - changed < datetime.timedelta(minutes=SETTLE_MINUTES):
         return MergeOutcome('waiting', 'opened or changed less than %d minutes ago: a later '
                             'run merges it' % SETTLE_MINUTES, stale)
     sha = pull['head']['sha']
@@ -773,24 +798,22 @@ def _merge_decision(gh, policy, org, repo, plan, branch, number, decisions, budg
         reply = send('graphql', {
             'query': 'mutation($id: ID!, $oid: GitObjectID!) { enqueuePullRequest(input: '
                      '{pullRequestId: $id, expectedHeadOid: $oid}) { mergeQueueEntry { id } } }',
-            'variables': {'id': pull['node_id'], 'oid': sha}})
+            'variables': {'id': pull['node_id'], 'oid': sha}}, queued_doubt)
         entry = _dig(reply, 'data', 'enqueuePullRequest', 'mergeQueueEntry', 'id')
         if isinstance(entry, str) and entry:
             return MergeOutcome('queued')
         errors = reply.get('errors')
         said = _dig(errors[0], 'message') if isinstance(errors, list) and errors else None
         return _refused(said if isinstance(said, str) and said else
-                        'GitHub did not confirm a merge queue entry; the pull request may be '
-                        'in the queue')
+                        queued_doubt + ': GitHub did not confirm a merge queue entry')
     reply = send('%s/pulls/%d/merge' % (api, number),
-                 {'merge_method': 'squash', 'sha': sha}, method='PUT')
+                 {'merge_method': 'squash', 'sha': sha}, merged_doubt, method='PUT')
     if reply.get('merged') is True:
         return MergeOutcome('merged')
     if reply.get('merged') is False:
         said = reply.get('message')
         return _refused(said if isinstance(said, str) and said else 'GitHub did not merge it')
-    return _refused('GitHub answered the merge call without confirming it; the pull request '
-                    'may have merged')
+    return _refused(merged_doubt + ': GitHub answered the merge call without confirming it')
 
 
 def try_merge(gh, policy, org, repo, plan, branch, number, decisions, budget, now=None,
@@ -808,9 +831,9 @@ def try_merge(gh, policy, org, repo, plan, branch, number, decisions, budget, no
     except RuntimeError as exc:
         return _refused(exc)
     except (KeyError, TypeError, ValueError, AttributeError, IndexError) as exc:
-        return _refused('unexpected answer from GitHub (%r)' % (exc,))
+        return _refused('unexpected answer from GitHub (%s)' % _named(exc))
     except Exception as exc:    # nothing may escape: the rows already made must still print
-        return _refused('unexpected error (%r)' % (exc,))
+        return _refused('unexpected error (%s)' % _named(exc))
 
 
 def merge_row(name, open_status, number, outcome, summary, first_license, decisions):

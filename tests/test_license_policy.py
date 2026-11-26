@@ -352,6 +352,15 @@ def ago(hours=0, minutes=0):
     return (NOW - datetime.timedelta(hours=hours, minutes=minutes)).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
+class Unprintable(Exception):
+    def __repr__(self):
+        raise ValueError('no repr')
+
+
+class _UnprintableKeyError(KeyError):
+    __repr__ = Unprintable.__repr__
+
+
 def required(*contexts):
     """A branch rule that requires these checks, as rules/branches/<branch> lists it."""
     return {'type': 'required_status_checks', 'parameters': {
@@ -1223,13 +1232,11 @@ class MergeTests(SweepCase):
                 sc.graphql_reply = reply
                 code, text, status = self.run_merge(gh)
                 self.assertEqual((code, status), (1, 'pr-open'))
-                self.assertIn('#12 not merged: merge refused: GitHub did not confirm a merge '
-                              'queue entry; the pull request may be in the queue (1 file(s))', text)
+                self.assertIn('#12 not merged: merge refused: the pull request may be in the '
+                              'queue: GitHub did not confirm a merge queue entry (1 file(s))', text)
 
     def test_an_unreadable_answer_to_the_merge_call_says_it_may_have_merged(self):
-        unread = ('#12 not merged: merge refused: GitHub\'s answer to the merge call could not be '
-                  'read; the pull request may have merged')
-        for queue in (False, True):
+        for queue, doubt in ((False, 'may have merged'), (True, 'may be in the queue')):
             for reply in (ValueError('Expecting value: line 1 column 1'), [], None, 'merged', 1):
                 with self.subTest(queue=queue, reply=reply):
                     gh, sc, _name = self.case()
@@ -1237,33 +1244,57 @@ class MergeTests(SweepCase):
                     sc.merge_reply = sc.graphql_reply = reply
                     code, text, status = self.run_merge(gh)
                     self.assertEqual((code, status, len(gh.merge_calls())), (1, 'pr-open', 1))
-                    self.assertIn(unread, text)
+                    self.assertIn('#12 not merged: merge refused: the pull request %s: GitHub\'s '
+                                  'answer could not be read (1 file(s))' % doubt, text)
 
     def test_a_merge_call_that_fails_in_an_unforeseen_way_says_it_may_have_merged(self):
-        for queue in (False, True):
-            for error in (OSError('boom'), IndexError('boom'), KeyError('boom')):
-                with self.subTest(queue=queue, error=error):
+        for queue, doubt in ((False, 'may have merged'), (True, 'may be in the queue')):
+            for error, shown in ((OSError('boom'), "OSError('boom')"),
+                                 (IndexError('boom'), "IndexError('boom')"),
+                                 (KeyError('boom'), "KeyError('boom')"),
+                                 (Unprintable(), 'Unprintable')):
+                with self.subTest(queue=queue, shown=shown):
                     gh, sc, _name = self.case()
                     sc.rules = [{'type': 'merge_queue'}] if queue else []
                     sc.merge_reply = sc.graphql_reply = error
                     code, text, status = self.run_merge(gh)
                     self.assertEqual((code, status, len(gh.merge_calls())), (1, 'pr-open', 1))
-                    self.assertIn('#12 not merged: merge refused: the merge call failed '
-                                  'unexpectedly (%r); the pull request may have merged' % (error,),
-                                  text)
+                    self.assertIn('#12 not merged: merge refused: the pull request %s: the call '
+                                  'failed unexpectedly (%s) (1 file(s))' % (doubt, shown), text)
 
-    def test_merge_call_that_raises_is_refused_with_the_reason(self):
-        gh, _sc, _name = self.case()
-        gh.fail = {'/pulls/12/merge'}
-        code, text, status = self.run_merge(gh)
-        self.assertEqual((code, status), (1, 'pr-open'))
-        self.assertIn('merge refused: gh api repos/example-org/drift/pulls/12/merge failed: boom '
-                      '(1 file(s))', text)
-        self.assertNotIn('second line', text)
+    def test_a_long_failure_of_the_merge_call_is_cut_after_the_warning(self):
+        gh, sc, _name = self.case()
+        sc.merge_reply = OSError('x' * 300)
+        full = ('the pull request may have merged: the call failed unexpectedly (%r)'
+                % (sc.merge_reply,))
+        self.assertEqual(self.direct(gh, sc, now=NOW).reason, 'merge refused: ' + full[:200])
+
+    def test_only_github_s_own_refusal_of_the_merge_call_reads_as_a_plain_refusal(self):
+        call = 'gh api -X PUT repos/example-org/drift/pulls/12/merge failed: '
+        for error, sure in ((call + 'gh: Pull Request is not mergeable (HTTP 405)\nsecond line', True),
+                            (call + 'gh: Head branch was modified. Review and try the merge again. '
+                             '(HTTP 409)', True),
+                            (call + 'gh: The merge queue is not accepting entries', True),
+                            (call + 'gh: Server Error (HTTP 502)', False),
+                            (call + 'gh: HTTP 504', False),
+                            (call + 'error connecting to api.github.com\nsecond line', False),
+                            ('gh: Pull Request is not mergeable (HTTP 405)', False),
+                            ('boom', False)):
+            for queue, doubt in ((False, 'may have merged'), (True, 'may be in the queue')):
+                with self.subTest(error=error, queue=queue):
+                    gh, sc, _name = self.case()
+                    sc.rules = [{'type': 'merge_queue'}] if queue else []
+                    sc.merge_reply = sc.graphql_reply = RuntimeError(error)
+                    code, text, status = self.run_merge(gh)
+                    self.assertEqual((code, status, len(gh.merge_calls())), (1, 'pr-open', 1))
+                    said = error.splitlines()[0]
+                    self.assertIn('#12 not merged: merge refused: %s (1 file(s))' % (
+                        said if sure else 'the pull request %s: %s' % (doubt, said)), text)
+                    self.assertNotIn('second line', text)
 
     def test_merge_response_that_is_not_merged_true_is_refused(self):
-        unconfirmed = ('GitHub answered the merge call without confirming it; the pull request '
-                       'may have merged')
+        unconfirmed = ('the pull request may have merged: GitHub answered the merge call '
+                       'without confirming it')
         for reply, why in (({'merged': False, 'message': 'Head branch was modified'},
                             'Head branch was modified'),
                            ({'merged': False}, 'GitHub did not merge it'),
@@ -1287,6 +1318,12 @@ class MergeTests(SweepCase):
             outcome = self.direct(gh, sc, now=NOW)
         self.assertEqual((outcome.status, outcome.reason),
                          ('refused', "merge refused: unexpected error (OSError('boom'))"))
+        with mock.patch.object(lp, '_merge_decision', side_effect=Unprintable()):
+            self.assertEqual(self.direct(gh, sc, now=NOW).reason,
+                             'merge refused: unexpected error (Unprintable)')
+        with mock.patch.object(lp, '_merge_decision', side_effect=_UnprintableKeyError()):
+            self.assertEqual(self.direct(gh, sc, now=NOW).reason,
+                             'merge refused: unexpected answer from GitHub (_UnprintableKeyError)')
         self.assertNoMerge(gh)
 
     def test_every_list_read_asks_for_a_hundred_entries(self):
@@ -1318,6 +1355,34 @@ class MergeTests(SweepCase):
         _code, text, _status = self.run_merge(gh)
         self.assertNoMerge(gh)
         self.assertIn('#12 not merged: merge refused: more than 100 entries at ', text)
+
+    def test_a_list_of_checks_statuses_or_reviews_too_long_to_read_refuses(self):
+        run = {'name': 'test', 'status': 'completed', 'conclusion': 'success'}
+        status = {'context': 'ci', 'state': 'success'}
+        review = {'state': 'APPROVED', 'user': {'login': 'someone'}}
+        for field, one in (('check_runs', run), ('statuses', status), ('reviews', review)):
+            for count, merges in ((99, True), (100, False)):
+                with self.subTest(field=field, count=count):
+                    gh, sc, _name = self.case()
+                    many = [one] * count
+                    setattr(sc, field, [many] if field == 'check_runs' else many)
+                    _code, text, _status = self.run_merge(gh)
+                    if merges:
+                        self.assertIn('#12 merged (1 file(s))', text)
+                    else:
+                        self.assertNoMerge(gh)
+                        self.assertIn('#12 not merged: merge refused: more than 100 entries at ',
+                                      text)
+
+    def test_a_last_change_dated_before_the_opening_refuses(self):
+        for first in (False, True):
+            with self.subTest(first=first):
+                gh, sc, _name = self.case(first=first, age_hours=30)
+                sc.pull['updated_at'] = ago(40)
+                code, text, status = self.run_merge(gh)
+                self.assertRefused(gh, text, status,
+                                   'its last change is dated before it was opened')
+                self.assertEqual(code, 1)
 
     def test_the_license_wanted_on_the_branch_is_the_repository_s_own(self):
         for wanted, seen, merges in (('Apache-2.0', 'Apache-2.0', True), ('Apache-2.0', 'MIT', False),

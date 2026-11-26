@@ -131,9 +131,10 @@ branch has a merge queue, the pull request is added to the queue instead.
 In the report, `merged` and `queued` say what was done. `waits: <why>` means
 the next run tries again, and it is not counted as a failure until the pull
 request is three days old. `not merged: <why>` means a guard refused, and the
-run ends non-zero. A reason that ends "the pull request may have merged" means
-the merge call went out and its answer was missing or made no sense: look at
-the pull request.
+run ends non-zero. A reason that starts "the pull request may have merged" or
+"the pull request may be in the queue" means the merge call went out and
+GitHub did not plainly refuse it: the answer was a server error, was missing,
+or made no sense. Look at the pull request.
 
 To stop one merge, close the pull request or mark it as a draft. To stop all
 of them, remove `merge = true`.
