@@ -171,6 +171,41 @@ What the guards cannot know:
   branch. The sweep after the merge reads the default branch again and reports
   a decision if GitHub no longer names it.
 
+## A license changed again after the sweep fixed it
+
+The sweep names its branch after the change it makes. So when a file differs
+again after the pull request for that change merged, someone or something
+changed it back, and the sweep finds its own merged pull request on that
+branch.
+
+With `refix_after_days = 7` under `[sweep]` in `policy.toml`, it makes the same
+change at most once every 7 days:
+
+- The newest pull request for the change merged 7 days ago or more: the sweep
+  opens a new one, which says which pull request it repeats. A later run merges
+  it under the guards above. The report shows `again after #N`.
+- It merged more recently: the sweep opens nothing and reports "#N merged but
+  the tree still differs", with the time from which it will make the change
+  again. The run is red until then, or until someone settles it.
+
+This limits how often. It does not judge why the file changed. An edit made
+the day after a merge is reported for six days and then changed back like any
+other.
+
+To keep an edit: close the pull request that puts it back. A closed pull
+request is final however old it is, so the sweep then reports the difference on
+every run and opens nothing more, until a `[repos.NAME]` entry records the
+exception or someone reopens the pull request.
+
+Without the setting, the sweep never makes a change twice. It reports it.
+
+One case it will not handle by itself. If the merged pull request's branch is
+still on GitHub at that pull request's last commit, a second pull request from
+it would conflict with the edit made since. The sweep reports that and asks for
+the branch to be deleted. It does not move or delete a branch. This cannot
+happen where the repository deletes branches on merge, which every repository
+the sweep manages did on 2026-11-26.
+
 ## What it will not do
 
 - Rewrite a copyright line that names anyone but the policy holder. A LICENSE
@@ -184,10 +219,8 @@ What the guards cannot know:
   only the sweep writes a first LICENSE, and its pull request says that merging
   is a grant that cannot be taken back.
 - Reopen a pull request someone closed. It reports the closed one instead.
-- Make the same change twice. If its pull request for a change already merged
-  and the file differs again, someone changed it back. It reports that as a
-  decision and opens nothing: put the file right by hand, or add a
-  `[repos.NAME]` entry if the difference is meant.
+- Make the same change more than once every `refix_after_days` days. See
+  "A license changed again after the sweep fixed it" above.
 - Edit a package manifest. A `package.json` or `pyproject.toml` whose license
   field disagrees with the LICENSE is reported.
 - Name a private repository. Private ones are counted and nothing more.

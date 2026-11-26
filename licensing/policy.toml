@@ -36,6 +36,11 @@ org = "StartupBros-com"
 # The sweep merges the pull requests it opened, once the guards listed under
 # "Merging" in README.md all hold. Remove this line and it only opens them.
 merge = true
+# A license file that differs again after the sweep's pull request for it
+# merged is put back by a new pull request, and the same change is made at most
+# once in this many days. Sooner than that the sweep reports it and the run is
+# red. Remove this line and it only ever reports.
+refix_after_days = 7
 
 # Per-repository exceptions. Keys:
 #   mode     = "hands-off"   the tool neither checks nor writes; needs a reason
